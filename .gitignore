@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project runtime data
+data/pokemon.db
+data/pvp_rankings.db
+data/speed_settings.json
+calibrations/
+cache/
+logs/
+
+# Environment files with secrets
+.env
+.env.local
+
+# Test artifacts
+test_screenshot.png
