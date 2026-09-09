@@ -1,0 +1,11 @@
+.git/
+.venv/
+graphify-out/
+calibrations/
+cache/
+data/
+logs/
+__pycache__/
+*.pyc
+.env
+.env.*

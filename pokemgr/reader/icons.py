@@ -1,6 +1,7 @@
 """Icon detection for shiny, shadow, favorite, lucky, and gender states."""
 
 import logging
+from typing import Literal
 import cv2
 import numpy as np
 from PIL import Image
@@ -93,6 +94,98 @@ def is_favorited(image: Image.Image, region: BBox) -> bool:
     is_detected = gold_ratio > 0.10
     log.debug("Favorite check: gold_ratio=%.3f → %s", gold_ratio, is_detected)
     return is_detected
+
+
+def _is_star_contour(contour: np.ndarray) -> bool:
+    """Require a complete five-point star, including all five inward corners."""
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter <= 0:
+        return False
+    polygon = cv2.approxPolyDP(contour, perimeter * 0.020, True)
+    if len(polygon) != 10:
+        return False
+    hull = cv2.convexHull(polygon, returnPoints=False)
+    try:
+        defects = cv2.convexityDefects(polygon, hull)
+    except cv2.error:
+        return False
+    if defects is None or len(defects) != 5:
+        return False
+    _x, _y, width, height = cv2.boundingRect(contour)
+    if any(defect[0][3] / 256 < min(width, height) * 0.10 for defect in defects):
+        return False
+    angles = np.arange(10) * np.pi / 5 - np.pi / 2
+    radii = np.where(np.arange(10) % 2 == 0, 50, 21)
+    template = np.rint(np.column_stack((
+        60 + np.cos(angles) * radii, 60 + np.sin(angles) * radii,
+    ))).astype(np.int32).reshape((-1, 1, 2))
+    return cv2.matchShapes(contour, template, cv2.CONTOURS_MATCH_I1, 0) < 0.15
+
+
+def favorite_state(image: Image.Image, region: BBox) -> Literal["on", "off", "unknown"]:
+    """Affirmatively identify a gold or gray star before a favorite toggle.
+
+    An absent, clipped, covered, or ambiguous glyph is unknown, never off.
+    The older Boolean reader remains unchanged for existing scan metadata.
+    """
+    if region.w <= 0 or region.h <= 0:
+        return "unknown"
+    # Existing phone profiles clip the lower/left star tips. Inspect a bounded
+    # neighborhood, but keep the recognized glyph centered in the calibration.
+    pad = round(max(region.w, region.h) * 0.9)
+    left, top = max(0, region.x-pad), max(0, region.y-pad)
+    right, bottom = min(image.width, region.x2+pad), min(image.height, region.y2+pad)
+    if left >= right or top >= bottom:
+        return "unknown"
+    rgb = np.array(image.convert("RGB").crop((left, top, right, bottom)))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    gold = ((hsv[:, :, 0] > 15) & (hsv[:, :, 0] < 35)
+            & (hsv[:, :, 1] > 100) & (hsv[:, :, 2] > 150))
+    gray = ((hsv[:, :, 1] < 65) & (hsv[:, :, 2] > 130) & (hsv[:, :, 2] < 235))
+    observed = []
+    for state, mask in (("on", gold), ("off", gray)):
+        contours, hierarchy = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        for i, contour in enumerate(contours):
+            if hierarchy[0][i][3] != -1:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if (x <= 1 or y <= 1 or x+w >= rgb.shape[1]-1 or y+h >= rgb.shape[0]-1
+                    or not 0.45*region.w < w < 1.6*region.w
+                    or not 0.45*region.h < h < 1.6*region.h
+                    or not 0.80 < w/h < 1.25):
+                continue
+            cx, cy = left+x+w/2, top+y+h/2
+            if not (region.x <= cx <= region.x2 and region.y <= cy <= region.y2):
+                continue
+            if not _is_star_contour(contour):
+                continue
+            filled = np.zeros(mask.shape, np.uint8)
+            cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
+            inside = filled.astype(bool)
+            coverage = float(np.mean(mask[inside]))
+            if state == "on":
+                if coverage > 0.85:
+                    observed.append(state)
+                continue
+            # Gray antialiasing around a colored glyph is not an off star.
+            if np.mean(gold[inside]) > 0.03:
+                continue
+            child = hierarchy[0][i][2]
+            holes = []
+            while child != -1:
+                holes.append(contours[child])
+                child = hierarchy[0][child][0]
+            hole = max(holes, key=cv2.contourArea) if holes else None
+            solid = coverage > 0.85
+            outlined = (0.15 < coverage < 0.75 and hole is not None
+                        and _is_star_contour(hole)
+                        and 0.25 < cv2.contourArea(hole)
+                        / cv2.contourArea(contour) < 0.85)
+            if solid or outlined:
+                observed.append(state)
+    return observed[0] if len(observed) == 1 else "unknown"
 
 
 def is_lucky(image: Image.Image, region: BBox) -> bool:

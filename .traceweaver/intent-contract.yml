@@ -1,0 +1,62 @@
+{
+  "intent_contract_id": "TW-IC-2026-09-09-001",
+  "contract_status": "stakeholder_authorized_scope",
+  "traceweaver_mode": "advisory",
+  "baseline_id": "REQ-BASELINE-2026-09-09-001",
+  "baseline_hash_sha256": "4b966981a29f704128139ccb4c85dfd6dcdbd456e08911d06a2b4379c2fb929a",
+  "baseline_source": "requirements.md",
+  "source": "Explicit owner requests in current Codex conversation, September8\u20139,2026",
+  "supersedes": "REQ-BASELINE-2026-08-24-001",
+  "requirements": [
+    [
+      "REQ-SCAN-001",
+      "Preserve CP only when complete species/form, HP and IV evidence validates it exactly."
+    ],
+    [
+      "REQ-SCAN-002",
+      "Read appraisal HP and IVs first; accept a unique calculated CP with independent confirmation, otherwise try OCR and optional bounded rotated-model animation or canceled preview recovery."
+    ],
+    [
+      "REQ-SCAN-003",
+      "Count verified storage positions independently, preserving same-stat adjacent specimens when transition evidence proves advancement; reject stale or unobserved transitions."
+    ],
+    [
+      "REQ-SCAN-004",
+      "Never transfer Pokemon or spend resources. Only the requested favorite/unfavorite actions or verified favorite-for-review fallback may change stars; preserve identity checks and one-tap readback."
+    ],
+    [
+      "REQ-STREAM-001",
+      "Provide an app-only stream with physical-screen controls, a bounded 30-frame native buffer and fresh display-bound frames; share frame OCR and report process CPU/RSS honestly, with unavailable GPU measurement labeled."
+    ],
+    [
+      "REQ-MASS-001",
+      "Use shared validated acquisition in Mass Actions and Decisions phone actions; verify full search text and exact keeper occurrences, and expose pause, stop, partial and unresolved results."
+    ],
+    [
+      "REQ-IDENTITY-001",
+      "Use caught species rather than editable nicknames; use candy only as a separate evolution-family constraint, never as the active evolved species."
+    ],
+    [
+      "REQ-DECISION-001",
+      "Keep selected best-IV, highest-current-CP and PvP picks per stored species/form, plus every exact15/15/15 occurrence by default. Respect unchecked rules and league CP limits; retain last-of-species protection."
+    ],
+    [
+      "REQ-DATA-001",
+      "Preserve one record per scan-session position, validated calibration geometry and cooperative resource cleanup; do not clear user data during publication."
+    ]
+  ],
+  "publication": {
+    "authorization": "commit/pr and merge",
+    "repo": "jjziets/PokemonGo-Storage-Manager",
+    "remote": "git@github.com:jjziets/PokemonGo-Storage-Manager.git",
+    "base": "dev",
+    "head": "codex/stream-scanning-and-keepers",
+    "merge_method": "squash"
+  },
+  "held_claims": [
+    "Complete storage reliability",
+    "Complete keeper/transfer advice",
+    "Measured GPU usage",
+    "Deployment or GUI runtime reload"
+  ]
+}

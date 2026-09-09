@@ -5,6 +5,7 @@ Fuzzy matches OCR output to find the closest real Pokemon name.
 """
 
 import logging
+from difflib import SequenceMatcher
 from functools import lru_cache
 
 log = logging.getLogger(__name__)
@@ -44,21 +45,10 @@ def _similarity(a: str, b: str) -> float:
     if a in b or b in a:
         return 0.8
 
-    # Character-level matching
-    shorter = min(len(a), len(b))
-    longer = max(len(a), len(b))
-    if shorter == 0:
-        return 0.0
-
-    # Count matching characters (order-sensitive)
-    matches = 0
-    b_remaining = list(b)
-    for char in a:
-        if char in b_remaining:
-            b_remaining.remove(char)
-            matches += 1
-
-    return matches / longer
+    # Preserve character order.  The previous bag-of-letters score could turn
+    # unrelated nicknames into official species merely because they shared
+    # several characters.
+    return SequenceMatcher(None, a, b).ratio()
 
 
 @lru_cache(maxsize=4096)
@@ -81,6 +71,12 @@ def match_species_name(ocr_name: str) -> str:
         if name.lower() == ocr_lower:
             return name
 
+    # Short partial OCR such as "Ke" must not be expanded into a plausible
+    # species (for example Keldeo).  Real three-letter species such as Mew and
+    # Muk were already handled by the exact-match branch above.
+    if len(ocr_lower) < 4:
+        return ocr_name
+
     # Find best fuzzy match
     best_name = ocr_name
     best_score = 0.0
@@ -91,16 +87,16 @@ def match_species_name(ocr_name: str) -> str:
         # Bonus for matching first 3 characters
         if len(ocr_lower) >= 3 and len(name) >= 3:
             if ocr_lower[:3] == name.lower()[:3]:
-                score += 0.15
+                score += 0.10
             elif ocr_lower[:2] == name.lower()[:2]:
-                score += 0.05
+                score += 0.03
 
         if score > best_score:
             best_score = score
             best_name = name
 
     # Only accept if confidence is high enough
-    if best_score >= 0.6:
+    if best_score >= 0.72:
         if best_name.lower() != ocr_lower:
             log.debug("Name corrected: '%s' → '%s' (score=%.2f)", ocr_name, best_name, best_score)
         return best_name

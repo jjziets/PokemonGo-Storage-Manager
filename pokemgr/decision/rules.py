@@ -7,6 +7,9 @@ from ..pvp.rankings_db import PvPRankingsDB
 
 log = logging.getLogger(__name__)
 
+# Match the caps used to build the IV tables in scripts/build_pvp_tables.py.
+_LEAGUE_CP_CAPS = {"little": 500, "great": 1500, "ultra": 2500}
+
 
 def _sort_key(p: Pokemon) -> tuple:
     """Default ranking: IV total desc, CP desc."""
@@ -18,6 +21,18 @@ def best_overall(pokemon_list: list[Pokemon]) -> Pokemon | None:
     if not pokemon_list:
         return None
     return max(pokemon_list, key=_sort_key)
+
+
+def perfect_ivs(pokemon_list: list[Pokemon]) -> list[Pokemon]:
+    """Keep every exact 15/15/15 occurrence, regardless of CP or category."""
+    return [p for p in pokemon_list if (p.atk, p.def_, p.sta) == (15, 15, 15)]
+
+
+def best_cp(pokemon_list: list[Pokemon]) -> Pokemon | None:
+    """Keep the highest current CP, using IV total to break a CP tie."""
+    if not pokemon_list:
+        return None
+    return max(pokemon_list, key=lambda p: (p.cp, p.iv_total))
 
 
 def best_shiny(pokemon_list: list[Pokemon]) -> Pokemon | None:
@@ -55,7 +70,10 @@ def best_size_tag(pokemon_list: list[Pokemon], tag: str) -> Pokemon | None:
 
 def best_pvp(pokemon_list: list[Pokemon], species_id: str,
              league: str, pvp_db: PvPRankingsDB) -> Pokemon | None:
-    """Find the best PvP candidate based on precomputed rankings."""
+    """Find the best ranked candidate that can still enter this CP league."""
+    cp_cap = _LEAGUE_CP_CAPS.get(league)
+    if cp_cap is None:
+        return None
     if not pvp_db.has_rankings(species_id, league):
         return None
 
@@ -63,6 +81,8 @@ def best_pvp(pokemon_list: list[Pokemon], species_id: str,
     best_rank = float("inf")
 
     for p in pokemon_list:
+        if p.cp > cp_cap:
+            continue
         rank = pvp_db.get_rank(species_id, league, p.atk, p.def_, p.sta)
         if rank is not None and rank < best_rank:
             best = p

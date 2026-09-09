@@ -1,484 +1,502 @@
-"""Execution module — favorite all KEEP Pokemon.
+"""Verified appraisal actions using the scanner's stream and native reader.
 
-Approach:
-  1. Search '!favorite' to show all unfavorited Pokemon
-  2. Tap first → open appraisal (same as scanning)
-  3. Read species, CP, IVs from appraisal screen
-  4. Match against keeper list using ALL fields: species + CP + ATK + DEF + STA
-  5. If exact match → tap star to favorite
-  6. Swipe left → repeat
-
-This is essentially a second scan pass, but instead of storing data
-we compare against the DB and favorite matches.
+Category actions need stable identity and a confirmed star state, not CP.
+Keeper actions additionally require an exact validated database signature.
+Searches never depend on favorite state, so changing a star leaves carousel
+membership unchanged. Occurrences are counted; identical stats are not an
+end-of-list signal or a reason to merge database rows.
 """
 
-import logging
-import time
+from collections import Counter, defaultdict
+from dataclasses import replace
 import json
-from pathlib import Path
+import logging
+import re
+import time
 from typing import Callable
-from collections import defaultdict
 
+from .. import timing
 from ..adb.controller import ADBController
-from ..adb.navigator import GameNavigator
 from ..calibration.profile import CalibrationProfile
-from ..reader.screen import ScreenReader
-from ..reader.ocr import read_cp, read_caught_species
-from ..reader.icons import is_favorited
 from ..data.database import PokemonDatabase
 from ..data.models import Pokemon
-from ..config import human_delay, DELAY_AFTER_SWIPE, LOGS_DIR
+from ..indexer.snapshot import AppraisalSnapshot, appraisal_frames_stable, validate_snapshot
+from ..indexer.state_machine import IndexingStateMachine
+from ..reader.icons import favorite_state
+from ..config import LOGS_DIR
 
 log = logging.getLogger(__name__)
 
 
+class _ReacquireAction(Exception):
+    """No star input was sent; discard a paused read and try again."""
+
+
 class Executor:
-    """Favorites KEEP Pokemon by opening appraisal and matching full stats."""
+    """Set stars only on independently confirmed storage positions."""
+
+    ALL_FAV_PASSES = [
+        ("Normal", "!shiny&!shadow&!dynamax&!gigantamax"),
+        ("Shiny", "shiny"), ("Shadow", "shadow"),
+        ("Dynamax", "dynamax"), ("Gigantamax", "gigantamax"),
+    ]
 
     def __init__(self, adb: ADBController, profile: CalibrationProfile,
                  db: PokemonDatabase):
-        self.adb = adb
-        self.profile = profile
-        self.nav = GameNavigator(adb, profile.regions)
-        self.reader = ScreenReader(profile)
+        self.adb, self.profile, self.db = adb, profile, db
+        self._scanner = IndexingStateMachine(adb, profile, db)
+        self.reader, self.nav = self._scanner.reader, self._scanner.nav
         self.regions = profile.regions
-        self.db = db
-
+        self._reader_threads = self._scanner._reader_threads
         self.on_progress: Callable | None = None
         self.on_error: Callable | None = None
-        self._abort = False
-        self._paused = False
+        self._abort = self._paused = False
+        self._current_flags = None
+        self.nav.is_cancelled = lambda: self._abort
 
-    ALL_FAV_PASSES = [
-        ("Normal", "!favorite&!shiny&!shadow&!dynamax&!gigantamax"),
-        ("Shiny", "!favorite&shiny"),
-        ("Shadow", "!favorite&shadow"),
-        ("Dynamax", "!favorite&dynamax"),
-        ("Gigantamax", "!favorite&gigantamax"),
-    ]
+    def _active(self):
+        while self._paused and not self._abort:
+            time.sleep(0.05)
+        return not self._abort
 
-    def favorite_keepers(self, dry_run: bool = False,
-                         selected_passes: list[str] | None = None) -> dict:
-        """Favorite all KEEP Pokemon using multi-pass search filters.
+    @staticmethod
+    def _keeper_key(pokemon):
+        """Nicknames are display text, never a keeper lookup key."""
+        if (not pokemon.species.strip() or pokemon.cp <= 0 or pokemon.hp <= 0
+                or any(value < 0 or value > 15 for value in (pokemon.atk, pokemon.def_, pokemon.sta))):
+            return None
+        return (pokemon.species.strip().casefold(), pokemon.cp, pokemon.hp,
+                pokemon.atk, pokemon.def_, pokemon.sta,
+                pokemon.shiny, pokemon.shadow, pokemon.lucky, pokemon.is_dynamax)
 
-        Args:
-            dry_run: if True, don't actually tap the star
-            selected_passes: list of pass names to run, e.g. ["Shiny", "Shadow"].
-                           If None, runs all passes.
+    @classmethod
+    def _snapshot_keeper_key(cls, snapshot):
+        from types import SimpleNamespace
+        return cls._keeper_key(SimpleNamespace(
+            species=snapshot.detected_species, cp=snapshot.cp, hp=snapshot.hp,
+            atk=snapshot.atk, def_=snapshot.def_, sta=snapshot.sta,
+            shiny=snapshot.shiny, shadow=snapshot.shadow, lucky=snapshot.lucky,
+            is_dynamax=snapshot.is_dynamax,
+        ))
+
+    @classmethod
+    def _selected_queries(cls, selected):
+        if selected is not None and not set(selected) <= {name for name, _ in cls.ALL_FAV_PASSES}:
+            raise ValueError("Unknown favorite pass")
+        excluded = []
+        for name, query in cls.ALL_FAV_PASSES:
+            if selected is not None and name not in selected:
+                continue
+            if name != "Normal":
+                query = "&".join([query, *excluded])
+                excluded.append("!" + dict(cls.ALL_FAV_PASSES)[name])
+            yield name, query
+
+    @classmethod
+    def _keeper_queries(cls, selected, required):
+        """Make every placeholder flag authoritative through the game filter.
+
+        ScreenReader defers shiny/shadow/Dynamax detection to pass filters.
+        Split only the combinations required by actual keeper rows. The two
+        Dynamax variants are disjoint even if the game's dynamax term also
+        includes Gigantamax; the existing selected-pass exclusions still apply.
         """
+        groups = sorted({key[6:] for key in required})
+        for name, base in cls._selected_queries(selected):
+            for shiny, shadow, lucky, dynamax in groups:
+                flags = dict(shiny=shiny, shadow=shadow, lucky=lucky, is_dynamax=dynamax)
+                common = [("" if value else "!") + term for term, value in
+                          (("shiny", shiny), ("shadow", shadow), ("lucky", lucky))]
+                variants = (("dynamax", "!gigantamax"), ("gigantamax",)) if dynamax else (("!dynamax", "!gigantamax"),)
+                for variant in variants:
+                    terms = list(dict.fromkeys([*base.split("&"), *common, *variant]))
+                    if any("!" + term in terms for term in terms if not term.startswith("!")):
+                        continue
+                    yield name, "&".join(terms), flags
+
+    def favorite_keepers(self, dry_run=False, selected_passes=None):
+        try:
+            return self._favorite_keepers(dry_run, selected_passes)
+        finally:
+            self._close_reader()
+
+    def _favorite_keepers(self, dry_run, selected_passes):
         all_pokemon = self.db.get_all()
-        keepers = [p for p in all_pokemon if p.decision == "KEEP"]
-        need_fav = [p for p in keepers if not p.favorited]
-
+        need_fav = [p for p in all_pokemon if p.decision == "KEEP" and not p.favorited]
         if not need_fav:
-            log.info("All keepers already favorited")
             return {"favorited": 0, "checked": 0}
-
-        # Build keeper lookup: species + IVs + HP (CP is unreliable from OCR)
-        keeper_set = set()
-        for p in need_fav:
-            keeper_set.add((p.species.lower(), p.atk, p.def_, p.sta, p.hp))
-
-        log.info("Need to favorite %d keepers (dry_run=%s)", len(need_fav), dry_run)
+        if self._abort:
+            return {"favorited": 0, "checked": 0, "dry_run": dry_run, "aborted": True}
+        # Validate [] separately from None before inspecting the inventory.
+        list(self._selected_queries(selected_passes))
+        groups = defaultdict(list)
+        for pokemon in all_pokemon:
+            groups[self._keeper_key(pokemon)].append(pokemon)
+        ambiguous = {key for key, rows in groups.items()
+                     if key is None or any(row.decision != "KEEP" for row in rows)
+                     or len({getattr(row, "scan_session_id", "") for row in rows}) > 1}
+        required = {self._keeper_key(p) for p in need_fav if self._keeper_key(p) not in ambiguous}
+        # Include already-starred occurrences of these same signatures. Seeing
+        # one must not consume the allowance for an identical unstarred keeper.
+        remaining = Counter(self._keeper_key(p) for p in all_pokemon
+                            if p.decision == "KEEP" and self._keeper_key(p) in required)
+        queries = list(self._keeper_queries(selected_passes, required))
+        blocked = sum(self._keeper_key(p) in ambiguous for p in need_fav)
         self._write_log(all_pokemon)
-
-        # Filter passes if selected
-        fav_passes = self.ALL_FAV_PASSES
-        if selected_passes:
-            fav_passes = [(n, q) for n, q in fav_passes if n in selected_passes]
-            log.info("Running selected passes: %s", [n for n, _ in fav_passes])
-
-        total_favorited = 0
-        total_checked = 0
-
-        for pass_name, search_query in fav_passes:
-            if self._abort:
+        totals = dict(favorited=0, checked=0, skipped=0, dry_run=dry_run)
+        for name, query, flags in queries:
+            if not remaining or not self._active():
                 break
-            if not keeper_set:
-                log.info("All keepers favorited — done")
-                break
-
-            log.info("=== Favorite pass: %s (%s) ===", pass_name, search_query)
+            if not any(key[6:] == tuple(flags.values()) for key in remaining):
+                continue
             if self.on_progress:
-                self.on_progress(total_favorited, len(need_fav),
-                                 f"Pass: {pass_name}")
+                self.on_progress(0, 0, f"Pass: {name}")
+            result = self._run_favorite_pass(query, remaining, dry_run, len(need_fav), flags=flags)
+            for key in ("favorited", "checked", "skipped"):
+                totals[key] += result.get(key, 0)
+            if result.get("error"):
+                totals["error"] = result["error"]
+                break
+        totals.update(unmatched=sum(remaining.values()) + blocked, ambiguous=blocked,
+                      aborted=self._abort)
+        if blocked:
+            totals["note"] = "Some keeper records have incomplete stats, conflicting decisions, or indistinguishable occurrences across scan sessions. These matches need review."
+        return totals
 
-            result = self._run_favorite_pass(
-                search_query, keeper_set, dry_run, len(need_fav)
+    def _run_favorite_pass(self, search_query, keeper_set, dry_run, total_keepers, *, flags=None):
+        return self._run_pass(search_query, True, dry_run=dry_run, keepers=keeper_set, flags=flags)
+
+    def favorite_by_filter(self, search_query, label=""):
+        try:
+            return self._favorite_by_filter(search_query, label)
+        finally:
+            self._close_reader()
+
+    def _favorite_by_filter(self, search_query, label):
+        result = self._run_pass(search_query, True)
+        result["label"] = label
+        return result
+
+    def unfavorite_all(self):
+        try:
+            return self._unfavorite_all()
+        finally:
+            self._close_reader()
+
+    def _unfavorite_all(self):
+        # Empty search stays on the game's suggestion page. Every Pokemon has
+        # nonnegative CP; this stable all-storage query opens an actual grid.
+        return self._run_pass("cp0-", False)
+
+    def _open_pass(self, query):
+        while self._active():
+            try:
+                return self._open_pass_once(query)
+            except _ReacquireAction:
+                # A pause during navigation invalidates the filter proof too.
+                continue
+        return 0
+
+    def _open_pass_once(self, query):
+        generation = self._scanner._pause_generation
+        if not query.strip():
+            raise ValueError("Action filter must open a Pokemon list; empty search shows suggestions")
+        if re.search(r"(?:^|[&,;|])!?favorite(?:$|[&,;|])", query, re.IGNORECASE):
+            raise ValueError("Action filter must not depend on favorite state")
+        for action in (self.nav.navigate_to_storage, lambda: self.nav.enter_search(query, verify=True)):
+            if not self._active():
+                return 0
+            self._check_generation(generation)
+            outcome = action()
+            self._check_generation(generation)
+            if outcome is False:
+                if self._abort:
+                    return 0
+                raise RuntimeError("Could not verify the complete storage search filter; no Pokemon opened")
+        if not self._active():
+            return 0
+        self._check_generation(generation)
+        total = self.nav.read_filtered_count()
+        self._check_generation(generation)
+        if not total:
+            # Count OCR cannot distinguish an empty result from unreadable.
+            # Never tap the first tile speculatively after a zero result.
+            log.info("Filter is empty or count unreadable; no Pokemon opened")
+            return 0
+        for action in (self.nav.tap_first_pokemon, self.nav.open_first_appraisal):
+            if not self._active():
+                return 0
+            self._check_generation(generation)
+            outcome = action()
+            self._check_generation(generation)
+            if outcome is False:
+                if self._abort:
+                    return 0
+                raise RuntimeError("Could not open the filtered appraisal")
+        return total
+
+    @staticmethod
+    def _identity(snapshot):
+        authority = snapshot.caught_species or getattr(snapshot, "candy_family", "")
+        if (not snapshot.read_complete or not authority or not snapshot.display_name
+                or snapshot.hp <= 0 or any(iv < 0 or iv > 15 for iv in snapshot.ivs)):
+            return None
+        return (snapshot.caught_species, getattr(snapshot, "candy_family", "") if not snapshot.caught_species else "",
+                snapshot.display_name, snapshot.hp, *snapshot.ivs,
+                snapshot.shiny, snapshot.shadow, snapshot.lucky, snapshot.is_dynamax)
+
+    def _same_identity(self, before, after, first, second):
+        left, right = self._identity(before), self._identity(after)
+        return (left is not None and right is not None
+                and (left == right or (left[:2] == right[:2] and left[3:] == right[3:]
+                     and self._scanner._review_name_drift(before, after, first, second)))
+                and appraisal_frames_stable(first, second))
+
+    def _read_identity(self, image):
+        if self.nav.detect_screen(image) != "appraisal" or not self.reader.are_bars_visible(image):
+            raise RuntimeError("Action held: appraisal is not confirmed")
+        detail, appraisal = self._scanner._read_appraisal_snapshot(image)
+        if self._current_flags is not None:
+            detail.update(self._current_flags)
+        # A missing classifier result is not evidence that its flag is false.
+        if any(type(detail.get(key)) is not bool for key in ("shiny", "shadow", "lucky", "is_dynamax")):
+            detail["snapshot_read_complete"] = False
+        return AppraisalSnapshot.from_reads(detail, appraisal)
+
+    def _check_generation(self, generation):
+        if self._paused or self._scanner._pause_generation != generation:
+            raise _ReacquireAction()
+
+    @timing.timed("action.acquire_identity")
+    def _acquire_identity(self, previous_frame, previous_snapshot, require_transition):
+        """Share native frame/pair reading without invoking CP recovery."""
+        scanner = self._scanner
+        for _attempt in range(3):
+            generation = scanner._pause_generation
+            scanner._settled_frame_pair = None
+            frame, status = scanner._wait_for_stable_appraisal(
+                previous_accepted=previous_frame, require_transition=require_transition,
+                allow_structured_fallback=True,
             )
-            total_favorited += result["favorited"]
-            total_checked += result["checked"]
-
-        result = {"favorited": total_favorited, "checked": total_checked, "dry_run": dry_run}
-        log.info("All favorite passes complete: %s", result)
-        return result
-
-    def _run_favorite_pass(self, search_query: str, keeper_set: set,
-                           dry_run: bool, total_keepers: int) -> dict:
-        """Run one favorite pass: navigate, search, swipe through, favorite matches."""
-
-        # Navigate to storage
-        if not self.nav.navigate_to_storage():
-            raise Exception("Cannot get to Pokemon storage")
-
-        # Enter search filter
-        self.nav.enter_search(search_query)
-        time.sleep(1)
-
-        pass_total = self.nav.read_filtered_count()
-        log.info("Filter '%s' matched %d Pokemon", search_query, pass_total)
-
-        if pass_total == 0:
-            # Could be OCR fail or truly empty — try anyway
-            pass
-
-        # Tap first and open appraisal
-        self.nav.tap_first_pokemon()
-        self.nav.open_first_appraisal()
-
-        favorited = 0
-        checked = 0
-        last_key = None
-        same_count = 0
-
-        while not self._abort:
-            # Pause
-            while self._paused and not self._abort:
-                time.sleep(0.5)
-
-            # Read appraisal
-            img = self._wait_for_bars(max_wait=2.0)
-            if img is None:
-                same_count += 1
-                if same_count >= 3:
-                    log.info("End of pass — no bars found")
-                    break
-                self.adb.swipe(*self.regions.swipe_start, *self.regions.swipe_end,
-                               self.regions.swipe_duration_ms)
-                human_delay(*DELAY_AFTER_SWIPE)
+            pair, scanner._settled_frame_pair = scanner._settled_frame_pair, None
+            if self._abort:
+                return None, frame
+            self._check_generation(generation)
+            if frame is None:
+                raise RuntimeError(f"Action held: {status.replace('_', ' ')}")
+            snapshot = self._read_identity(frame)
+            if self._abort:
+                return None, frame
+            if (isinstance(pair, tuple) and len(pair) == 2 and pair[1] is frame
+                    and pair[0] is not frame and scanner._independent_frame_sources(*pair)):
+                confirmation_frame = pair[0]
+            else:
+                confirmation_frame = scanner._fast_screencap()
+            if self._abort:
+                return None, frame
+            confirmation = self._read_identity(confirmation_frame)
+            self._check_generation(generation)
+            if not self._same_identity(snapshot, confirmation, frame, confirmation_frame):
                 continue
+            if status != "stable":
+                # Two full agreeing reads may prove an unobserved move only
+                # when species/HP/IV/flags differ. Name OCR alone proves none.
+                before, after = self._identity(previous_snapshot) if previous_snapshot else None, self._identity(snapshot)
+                if (status != "stable_transition_unobserved" or before is None
+                        or (before[:2], before[3:]) == (after[:2], after[3:])):
+                    raise RuntimeError("Action held: next storage position could not be verified")
+            return snapshot, frame
+        raise RuntimeError("Action held: complete appraisal identity did not agree after 3 reads")
 
+    @timing.timed("action.star")
+    def _set_star(self, snapshot, frame, target, *, dry_run=False, cp_decision=None):
+        """Check identity and tri-state star before one tap, then verify it."""
+        desired = "on" if target else "off"
+        scanner = self._scanner
+        generation = scanner._pause_generation
+        initial = frame
+        for _attempt in range(3):
+            frame = scanner._fast_screencap()
             if self._abort:
+                return False, frame
+            fresh = self._read_identity(frame)
+            self._check_generation(generation)
+            if not self._same_identity(snapshot, fresh, initial, frame):
+                raise RuntimeError("Action held: appraisal identity changed before star input")
+            state = favorite_state(frame, self.regions.favorite_star_region)
+            if state in ("on", "off"):
                 break
-
-            # Read only what we need: species (bubble), IVs (bars), HP, fav status
-            import threading
-            appraisal = self.reader.read_appraisal_screen(img)
-
-            hp_result = [-1]
-            species_result = [""]
-            def _read_hp_species():
-                w, h = self.regions.screen_width, self.regions.screen_height
-                hp_result[0] = self.reader.read_hp(img)
-                species_result[0] = read_caught_species(img, w, h)
-            bg = threading.Thread(target=_read_hp_species)
-            bg.start()
-
-            atk = appraisal.get("atk", -1)
-            def_ = appraisal.get("def_", -1)
-            sta = appraisal.get("sta", -1)
-            already_fav = is_favorited(img, self.regions.favorite_star_region)
-
-            bg.join(timeout=5)
+        else:
+            raise RuntimeError("Action held: favorite star is unreadable")
+        if cp_decision is not None and not cp_decision.cp_source.startswith("calculated"):
+            # A newly visible, valid contradictory CP must not inherit an old
+            # recovery result, even when rounded HP and all IVs are identical.
+            cp, _confidence = self.reader.read_cp(frame)
+            visible = validate_snapshot(replace(fresh, cp=cp), allow_calculated_cp=False)
+            if visible.accepted and visible.snapshot.cp != snapshot.cp:
+                raise RuntimeError("Action held: visible CP changed before star input")
+        self._check_generation(generation)
+        if self._abort:
+            return False, frame
+        if state == desired:
+            return False, frame
+        if dry_run:
+            return True, frame
+        if not scanner._safe_tap(*self.regions.favorite_star_region.center, jitter=0):
+            return False, frame
+        for _attempt in range(3):
             if self._abort:
-                break
-            hp = hp_result[0]
-            validated_species = species_result[0]
+                return False, frame
+            time.sleep(0.1)
+            frame = scanner._fast_screencap()
+            if self._abort:
+                return False, frame
+            fresh = self._read_identity(frame)
+            if self._abort:
+                return False, frame
+            if not self._same_identity(snapshot, fresh, initial, frame):
+                raise RuntimeError("Action held: appraisal identity changed after star input")
+            if favorite_state(frame, self.regions.favorite_star_region) == desired:
+                return True, frame
+        raise RuntimeError("Action held: star change was not confirmed after one tap")
 
-            # Fallback to OCR name if bubble failed
-            if not validated_species:
-                detail = self.reader.read_detail_screen(img)
-                validated_species = detail.get("species", "")
+    def _advance_action(self, snapshot, frame):
+        """The pre-swipe frame must still be the position just completed."""
+        while self._active():
+            generation = self._scanner._pause_generation
+            fresh = self._scanner._fast_screencap()
+            if self._abort:
+                return False
+            current = self._read_identity(fresh)
+            if self._abort:
+                return False
+            try:
+                self._check_generation(generation)
+            except _ReacquireAction:
+                continue
+            if not self._same_identity(snapshot, current, frame, fresh):
+                raise RuntimeError("Action held: completed position changed before swipe")
+            self._scanner._last_stable_image = fresh
+            return self._scanner._fast_swipe()
+        return False
 
-            # HP retry
-            if hp <= 0 and not self._abort:
-                time.sleep(0.2)
-                retry_img = self.adb.screencap()
-                hp = self.reader.read_hp(retry_img)
-
-            checked += 1
-            log.info("Fav check #%d: %s %d/%d/%d HP%d%s",
-                     checked, validated_species, atk, def_, sta, hp,
-                     " (already fav)" if already_fav else "")
-
-            # End-of-list detection (ignore HP — it can fail and flip the key)
-            current_key = (validated_species, atk, def_, sta)
-            if current_key == last_key:
-                same_count += 1
-                if same_count >= 3:
-                    log.info("End of list — same Pokemon %d times", same_count + 1)
-                    break
-            else:
-                same_count = 0
-                last_key = current_key
-
-            # Stop if we've exceeded the filtered count (+10% safety margin)
-            if pass_total > 0 and checked > pass_total * 1.1 + 5:
-                log.info("Exceeded filter count (%d checked, %d expected) — stopping",
-                         checked, pass_total)
-                break
-
-            # Match against keeper list: species + IVs + HP
-            if validated_species and hp > 0:
-                match_key = (validated_species.lower(), atk, def_, sta, hp)
-                is_keeper = match_key in keeper_set
-            else:
-                is_keeper = False
-
-            if is_keeper and not already_fav:
-                if dry_run:
-                    favorited += 1
-                    keeper_set.discard(match_key)
-                    log.info("DRY RUN — would favorite: %s %d/%d/%d HP%d",
-                             validated_species, atk, def_, sta, hp)
-                else:
-                    star_center = self.regions.favorite_star_region.center
-                    self.adb.tap(*star_center, jitter=3)
-                    human_delay(0.3, 0.1)
-
-                    img2 = self.adb.screencap()
-                    if is_favorited(img2, self.regions.favorite_star_region):
-                        favorited += 1
-                        keeper_set.discard(match_key)
-                        log.info("Favorited: %s %d/%d/%d HP%d",
-                                 validated_species, atk, def_, sta, hp)
+    def _run_pass(self, query, target, *, dry_run=False, keepers=None, flags=None):
+        count_key = "favorited" if target else "unfavorited"
+        result = {count_key: 0, "checked": 0, "skipped": 0}
+        scanner = self._scanner
+        self._current_flags = None
+        scanner._last_validated_identity_key = scanner._previous_validated_identity_key = None
+        previous_frame = previous_snapshot = None
+        transition = False
+        try:
+            if not self._active():
+                return result | {"aborted": True}
+            self.reader.prepare_native_ocr()
+            total = self._open_pass(query)
+            self._current_flags = flags
+            if total == 0 and not self._abort:
+                result["note"] = "Filter empty or count unreadable; no Pokemon opened"
+            while result["checked"] < total and self._active():
+                try:
+                    generation = scanner._pause_generation
+                    decision = None
+                    if keepers is None:
+                        snapshot, frame = self._acquire_identity(previous_frame, previous_snapshot, transition)
                     else:
-                        log.warning("Star tap failed for %s %d/%d/%d",
-                                    validated_species, atk, def_, sta)
-
-            elif is_keeper and already_fav:
-                keeper_set.discard(match_key)
-                log.info("Already favorited: %s %d/%d/%d HP%d",
-                         validated_species, atk, def_, sta, hp)
-
-            # Progress: checked/total so user sees how far through storage we are
-            if self.on_progress:
-                fav_str = f"fav:{favorited}" if favorited > 0 else ""
-                self.on_progress(
-                    checked, pass_total if pass_total > 0 else 0,
-                    f"#{checked} {validated_species or '?'} {atk}/{def_}/{sta} HP{hp} {fav_str}".strip()
-                )
-
-            # Swipe to next
-            self.adb.swipe(*self.regions.swipe_start, *self.regions.swipe_end,
-                           self.regions.swipe_duration_ms)
-            human_delay(*DELAY_AFTER_SWIPE)
-
-        # Back to storage
-        self.adb.tap(*self.nav._s(484, 2260), jitter=3)  # X close
-        time.sleep(0.5)
-        self.adb.key_event(4)
-        time.sleep(0.5)
-
-        log.info("Pass done: %d favorited, %d checked", favorited, checked)
-        return {"favorited": favorited, "checked": checked}
-
-    def favorite_by_filter(self, search_query: str, label: str = "") -> dict:
-        """Favorite ALL Pokemon matching a search filter.
-
-        No keeper matching — just swipe through and star everything unfavorited.
-        Uses filter like 'shiny', 'shadow', 'legendary', '4*', etc.
-        """
-        # Prepend !favorite so we only see unfavorited ones
-        full_query = f"!favorite&{search_query}"
-        log.info("Favorite by filter: '%s' (%s)", full_query, label)
-
-        if not self.nav.navigate_to_storage():
-            raise Exception("Cannot get to Pokemon storage")
-
-        self.nav.enter_search(full_query)
-        time.sleep(1)
-
-        pass_total = self.nav.read_filtered_count()
-        log.info("Filter '%s' matched %d Pokemon", full_query, pass_total)
-
-        if pass_total == 0:
-            return {"favorited": 0, "checked": 0, "label": label}
-
-        self.nav.tap_first_pokemon()
-        self.nav.open_first_appraisal()
-
-        favorited = 0
-        checked = 0
-        last_key = None
-        same_count = 0
-
-        while not self._abort:
-            while self._paused and not self._abort:
-                time.sleep(0.5)
-
-            img = self._wait_for_bars(max_wait=2.0)
-            if img is None:
-                same_count += 1
-                if same_count >= 3:
-                    log.info("End of list — no bars")
-                    break
-                self.adb.swipe(*self.regions.swipe_start, *self.regions.swipe_end,
-                               self.regions.swipe_duration_ms)
-                human_delay(*DELAY_AFTER_SWIPE)
-                continue
-
-            if self._abort:
-                break
-
-            # Read species from bubble + IVs for logging/dedup detection
-            w, h = self.regions.screen_width, self.regions.screen_height
-            species = read_caught_species(img, w, h) or "?"
-            appraisal = self.reader.read_appraisal_screen(img)
-            atk = appraisal.get("atk", -1)
-            def_ = appraisal.get("def_", -1)
-            sta = appraisal.get("sta", -1)
-            already_fav = is_favorited(img, self.regions.favorite_star_region)
-
-            checked += 1
-
-            # End-of-list detection
-            current_key = (species, atk, def_, sta)
-            if current_key == last_key:
-                same_count += 1
-                if same_count >= 3:
-                    log.info("End of list — same Pokemon %d times", same_count + 1)
-                    break
-            else:
-                same_count = 0
-                last_key = current_key
-
-            # Stop if we've exceeded the filtered count
-            if pass_total > 0 and checked > pass_total * 1.1 + 5:
-                log.info("Exceeded filter count (%d checked, %d expected) — stopping",
-                         checked, pass_total)
-                break
-
-            if not already_fav:
-                star_center = self.regions.favorite_star_region.center
-                self.adb.tap(*star_center, jitter=3)
-                human_delay(0.3, 0.1)
-                favorited += 1
-                log.info("Favorited #%d: %s %d/%d/%d", favorited, species, atk, def_, sta)
-            else:
-                log.info("Already fav: %s %d/%d/%d", species, atk, def_, sta)
-
-            if self.on_progress:
-                fav_str = f"fav:{favorited}" if favorited > 0 else ""
-                self.on_progress(
-                    checked, pass_total if pass_total > 0 else 0,
-                    f"#{checked} {species} {atk}/{def_}/{sta} {fav_str}".strip()
-                )
-
-            self.adb.swipe(*self.regions.swipe_start, *self.regions.swipe_end,
-                           self.regions.swipe_duration_ms)
-            human_delay(*DELAY_AFTER_SWIPE)
-
-        # Close appraisal
-        self.adb.tap(*self.nav._s(484, 2260), jitter=3)
-        time.sleep(0.5)
-        self.adb.key_event(4)
-        time.sleep(0.5)
-
-        log.info("Filter fav done: %d favorited, %d checked", favorited, checked)
-        return {"favorited": favorited, "checked": checked, "label": label}
-
-    def unfavorite_all(self) -> dict:
-        """Unfavorite ALL Pokemon by searching 'favorite' and swiping through detail screens."""
-        log.info("Unfavoriting all Pokemon...")
-
-        if not self.nav.navigate_to_storage():
-            raise Exception("Cannot get to Pokemon storage")
-
-        self.nav.enter_search("favorite")
-        time.sleep(1)
-
-        count_expected = self.nav.read_filtered_count()
-        log.info("Found %d favorited Pokemon", count_expected)
-
-        if count_expected == 0:
-            return {"unfavorited": 0}
-
-        # Tap first Pokemon — stays on detail screen (no appraisal needed)
-        self.nav.tap_first_pokemon()
-        time.sleep(1)
-
-        unfavorited = 0
-        last_cp = None
-        same_count = 0
-        max_checks = count_expected + 20 if count_expected > 0 else 5000
-
-        for i in range(max_checks):
-            if self._abort:
-                break
-
-            img = self.adb.screencap()
-            cp, _ = read_cp(img, self.regions.cp_region)
-            fav = is_favorited(img, self.regions.favorite_star_region)
-
-            if cp == last_cp:
-                same_count += 1
-                if same_count >= 4:
-                    break
-            else:
-                same_count = 0
-                last_cp = cp
-
-            if fav:
-                star_center = self.regions.favorite_star_region.center
-                self.adb.tap(*star_center, jitter=3)
-                human_delay(0.2, 0.1)
-                unfavorited += 1
-
+                        decision, frame, kind, reason = scanner._acquire_validated_snapshot(
+                            previous_accepted=previous_frame, require_transition=transition,
+                        )
+                        if kind == "reacquire":
+                            continue
+                        if kind == "transition_returned_to_previous":
+                            decision, frame, kind, reason = scanner._recover_failed_transition(frame)
+                        if self._abort:
+                            break
+                        if decision is None:
+                            if kind != "invalid" or frame is None:
+                                raise RuntimeError(f"Action held: {reason}")
+                            # Unresolved CP cannot authorize a keeper star, but
+                            # a confirmed position may be skipped without input.
+                            snapshot, frame = self._acquire_identity(previous_frame, previous_snapshot, transition)
+                        else:
+                            snapshot = decision.snapshot
+                            if flags is not None:
+                                snapshot = replace(snapshot, **flags)
+                                decision = replace(decision, snapshot=snapshot)
+                    if self._abort or snapshot is None:
+                        break
+                    self._check_generation(generation)
+                    # A generic family is sufficient for collection scanning,
+                    # but cannot authorize an exact-form keeper action.
+                    match_key = self._snapshot_keeper_key(snapshot) if decision and decision.exact_form else None
+                    matches = keepers is None or (match_key is not None and keepers[match_key] > 0)
+                    if matches:
+                        changed, frame = self._set_star(snapshot, frame, target, dry_run=dry_run, cp_decision=decision)
+                        if self._abort:
+                            break
+                        result[count_key] += int(changed)
+                        if keepers is not None:
+                            keepers[match_key] -= 1
+                            if not keepers[match_key]:
+                                del keepers[match_key]
+                    else:
+                        result["skipped"] += 1
+                except _ReacquireAction:
+                    continue
+                result["checked"] += 1
                 if self.on_progress:
-                    self.on_progress(unfavorited, count_expected,
-                                     f"Unfavorited #{unfavorited} (CP{cp})")
-
-            self.adb.swipe(*self.regions.swipe_start, *self.regions.swipe_end,
-                           self.regions.swipe_duration_ms)
-            human_delay(*DELAY_AFTER_SWIPE)
-
-        self.adb.key_event(4)
-        time.sleep(1)
-
-        result = {"unfavorited": unfavorited}
-        log.info("Unfavoriting complete: %s", result)
+                    summary = snapshot.caught_species or snapshot.detected_species or "Unknown species"
+                    self.on_progress(result["checked"], total,
+                                     f"#{result['checked']} {summary} HP{snapshot.hp} "
+                                     f"{snapshot.atk}/{snapshot.def_}/{snapshot.sta} · {count_key}: {result[count_key]}"
+                                     + (" (dry run)" if dry_run else ""))
+                scanner._previous_validated_identity_key = scanner._last_validated_identity_key
+                scanner._last_validated_identity_key = scanner._complete_identity_key(snapshot) if decision else None
+                previous_frame, previous_snapshot = frame, snapshot
+                if result["checked"] >= total or (keepers is not None and not keepers) or not self._active():
+                    break
+                scanner._last_stable_image = frame
+                if not self._advance_action(snapshot, frame):
+                    if self._abort:
+                        break
+                    raise RuntimeError("Action held: could not advance from confirmed appraisal")
+                previous_frame = scanner._last_stable_image
+                transition = True
+        except Exception as exc:
+            result["error"] = str(exc)
+            log.exception("Mass action held")
+            if self.on_error:
+                self.on_error(str(exc))
+        finally:
+            self._current_flags = None
+        result["aborted"] = self._abort
         return result
 
-    def _wait_for_bars(self, max_wait: float = 2.0):
-        """Wait for appraisal bars to appear."""
-        deadline = time.time() + max_wait
-        while time.time() < deadline and not self._abort:
-            img = self.adb.screencap()
-            if self.reader.are_bars_visible(img):
-                return img
-            time.sleep(0.3)
-        return None
+    def _close_reader(self):
+        self._scanner._close_reader()
 
     def _write_log(self, all_pokemon: list[Pokemon]):
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        path = LOGS_DIR / f"execution_{timestamp}.json"
-
+        path = LOGS_DIR / f"execution_{time.strftime('%Y%m%d_%H%M%S')}.json"
         data = {"keep": [], "transfer": []}
-        for p in all_pokemon:
-            entry = {
-                "species": p.species, "cp": p.cp,
-                "atk": p.atk, "def": p.def_, "sta": p.sta,
-                "iv_pct": round(p.iv_pct, 4),
-                "decision": p.decision, "reason": p.decision_reason,
-            }
-            if p.decision == "KEEP":
-                data["keep"].append(entry)
-            else:
-                data["transfer"].append(entry)
-
+        for pokemon in all_pokemon:
+            data["keep" if pokemon.decision == "KEEP" else "transfer"].append({
+                "species": pokemon.species, "cp": pokemon.cp,
+                "atk": pokemon.atk, "def": pokemon.def_, "sta": pokemon.sta,
+                "iv_pct": round(pokemon.iv_pct, 4),
+                "decision": pokemon.decision, "reason": pokemon.decision_reason,
+            })
         path.write_text(json.dumps(data, indent=2))
-        log.info("Execution log saved: %s", path)
 
     def pause(self):
         self._paused = True
-        log.info("Executor paused")
+        self._scanner.pause()
 
     def resume(self):
+        self._scanner.resume()
         self._paused = False
-        log.info("Executor resumed")
 
     def abort(self):
         self._abort = True
-        self._paused = False  # unblock if paused
+        self._paused = False
+        self._scanner.abort()

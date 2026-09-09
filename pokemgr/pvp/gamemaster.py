@@ -44,6 +44,8 @@ def parse_species(gamemaster: dict) -> dict[str, dict]:
             "base_sta": 225,
             "types": ["water", "ground"],
             "evolutions": [...],
+            "family_id": "FAMILY_MUDKIP",
+            "dex": 260,
         }
     """
     species_map = {}
@@ -66,6 +68,8 @@ def parse_species(gamemaster: dict) -> dict[str, dict]:
             "base_sta": base_stats.get("hp", 0),
             "types": entry.get("types", []),
             "evolutions": _parse_evolutions(entry),
+            "family_id": (entry.get("family") or {}).get("id", ""),
+            "dex": entry.get("dex", 0),
         }
 
     log.info("Parsed %d species from gamemaster", len(species_map))

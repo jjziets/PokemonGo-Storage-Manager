@@ -41,7 +41,12 @@ class MultiPassScanner:
                  db: PokemonDatabase):
         self.adb = adb
         self.profile = profile
-        self.nav = GameNavigator(adb, profile.regions)
+        self._abort = False
+        self.nav = GameNavigator(
+            adb,
+            profile.regions,
+            cancelled=lambda: self._abort,
+        )
         self.db = db
         self.passes = list(DEFAULT_PASSES)
         self.unfavorite_all = False
@@ -60,39 +65,50 @@ class MultiPassScanner:
 
         self._total_count = 0
         self._total_skipped = 0
-        self._abort = False
         self._current_sm: IndexingStateMachine | None = None
 
     def start(self):
         from ..scan_logger import start_scan_log, stop_scan_log
+        # Calls and idle periods can reactivate Samsung Touch Protection.  Clear
+        # it at the exact start boundary before any screen classification/taps.
+        self.nav.clear_touch_protection()
+        time.sleep(0.25)
         log_path = start_scan_log()
         log.info("Multi-pass scan: %d passes (log: %s)", len(self.passes), log_path)
         self._total_count = 0
+        fatal_failure = None
 
-        for i, scan_pass in enumerate(self.passes):
-            if self._abort:
-                break
+        try:
+            for i, scan_pass in enumerate(self.passes):
+                if self._abort:
+                    break
 
-            log.info("=== Pass %d/%d: %s (%s) ===",
-                     i + 1, len(self.passes), scan_pass.name, scan_pass.search_query)
+                log.info("=== Pass %d/%d: %s (%s) ===",
+                         i + 1, len(self.passes), scan_pass.name, scan_pass.search_query)
 
-            if self.on_pass_start:
-                self.on_pass_start(i, scan_pass.name, scan_pass.search_query)
+                if self.on_pass_start:
+                    self.on_pass_start(i, scan_pass.name, scan_pass.search_query)
 
-            try:
-                pass_count = self._run_pass(scan_pass)
-            except Exception as e:
-                log.error("Pass %s failed: %s", scan_pass.name, e)
-                if self.on_error:
-                    self.on_error(f"Pass {scan_pass.name} failed: {e}")
-                pass_count = 0
+                try:
+                    pass_count = self._run_pass(scan_pass)
+                except Exception as e:
+                    log.exception("Pass %s failed: %s", scan_pass.name, e)
+                    fatal_failure = (scan_pass.name, e)
+                    break
 
-            if self.on_pass_end:
-                self.on_pass_end(i, pass_count)
+                if self.on_pass_end:
+                    self.on_pass_end(i, pass_count)
+        finally:
+            stop_scan_log()
+
+        if fatal_failure:
+            pass_name, cause = fatal_failure
+            log.error("Stopped remaining passes after %s failed", pass_name)
+            raise RuntimeError(
+                f"Pass {pass_name} failed; scan stopped: {cause}"
+            ) from cause
 
         log.info("Done: %d total Pokemon, %d skipped", self._total_count, self._total_skipped)
-        from ..scan_logger import stop_scan_log
-        stop_scan_log()
         if self.on_finished:
             self.on_finished(self._total_count)
 
@@ -115,9 +131,6 @@ class MultiPassScanner:
         if self._abort:
             return 0
 
-        if self._abort:
-            return 0
-
         # Step 2: Clear old search and enter new filter
         log.info("Entering filter: %s", scan_pass.search_query)
         self._clear_and_search(scan_pass.search_query)
@@ -125,12 +138,32 @@ class MultiPassScanner:
         if self._abort:
             return 0
 
-        # Read how many Pokemon match this filter
-        pass_expected = self.nav.read_filtered_count()
-        if self.max_per_pass > 0 and pass_expected > 0:
-            pass_expected = min(pass_expected, self.max_per_pass)
+        # Read how many Pokemon match this filter.  A resume skip is a position
+        # offset, not work completed in this run, so the state-machine target is
+        # the number of new positions remaining after the skipped prefix.
+        filtered_count = self.nav.read_filtered_count()
+        resume_skip = max(0, int(self.skip_first_n))
+        if filtered_count > 0 and resume_skip >= filtered_count:
+            raise RuntimeError(
+                f"Resume skip {resume_skip} leaves no Pokemon to scan "
+                f"(filter count: {filtered_count})"
+            )
+
+        pass_expected = (
+            max(0, filtered_count - resume_skip)
+            if filtered_count > 0 else 0
+        )
+        if self.max_per_pass > 0:
+            pass_expected = (
+                min(pass_expected, self.max_per_pass)
+                if pass_expected > 0 else self.max_per_pass
+            )
         self._pass_expected = pass_expected
-        log.info("Filter matched %d Pokemon", pass_expected)
+        log.info(
+            "Filter matched %d Pokemon; %d new positions after resume/cap",
+            filtered_count,
+            pass_expected,
+        )
 
         if self.on_pass_count:
             self.on_pass_count(pass_expected)
@@ -140,30 +173,27 @@ class MultiPassScanner:
         if pass_expected == 0:
             log.warning("Could not read filter count — proceeding anyway")
 
-        # Step 3: Tap first Pokemon and open appraisal
-        self.nav.tap_first_pokemon()
-        if self._abort:
-            return 0
-
-        self.nav.open_first_appraisal()
-        if self._abort:
-            return 0
+        # Step 3: Tap the first Pokemon, but only use detail-screen menu
+        # coordinates after screen detection confirms that the detail screen
+        # actually opened.  A missed grid tap previously made the appraisal
+        # taps land on storage and could return the scan to the game map.
+        if not self._prepare_first_appraisal(scan_pass.search_query):
+            if self._abort:
+                return 0
+            raise Exception("Cannot open first Pokemon appraisal")
 
         # Step 4: Scan
         sm = IndexingStateMachine(self.adb, self.profile, self.db)
         sm.unfavorite_all = self.unfavorite_all
         # Apply skip for resume (only on first pass)
-        if self.skip_first_n > 0:
-            sm.skip_first_n = self.skip_first_n
+        if resume_skip > 0:
+            sm.skip_first_n = resume_skip
             sm.skip_delay = self.skip_delay
             sm.resume_target_species = self.resume_target_species
             sm.resume_target_cp = self.resume_target_cp
             self.skip_first_n = 0  # only skip on first pass
         if self.max_per_pass > 0:
             sm.max_count = self.max_per_pass
-        elif pass_expected > 0:
-            # Use OCR count + 5% as safety limit (in case OCR was slightly off)
-            sm.max_count = int(pass_expected * 1.05) + 10
         self._current_sm = sm
 
         tags = scan_pass.tags
@@ -176,23 +206,26 @@ class MultiPassScanner:
         sm.on_progress = on_progress
         sm.on_error = self.on_error
 
-        sm.start()
-        self._total_skipped += sm.skipped_count
-        self._current_sm = None
+        try:
+            sm.start(expected_total=pass_expected if pass_expected > 0 else None)
+        finally:
+            # Do not leave a failed state machine attached while the outer
+            # scanner reports the error or the GUI requests Stop.
+            self._current_sm = None
+            self._total_skipped += sm.skipped_count
 
-        # Apply tags to ALL Pokemon from this pass's session
-        if tags and sm.count > 0:
-            log.info("Tagging %d Pokemon from pass '%s' with %s",
-                     sm.count, scan_pass.name, tags)
-            self._apply_tags_to_session(sm.session_id, tags)
+            # A fatal OCR/runtime error can happen after valid rows were
+            # stored.  Preserve those partial rows with the correct pass tags
+            # even though the session remains visibly incomplete.
+            if tags and sm.count > 0:
+                log.info("Tagging %d Pokemon from pass '%s' with %s",
+                         sm.count, scan_pass.name, tags)
+                self._apply_tags_to_session(sm.session_id, tags)
 
         # After scan ends, close appraisal and get back to storage
         log.info("Pass done (%d scanned), returning to storage...", sm.count)
-        # Tap X to close appraisal, then back to storage
-        self.adb.tap(*self.nav._s(484, 2260), jitter=3)  # X button
-        time.sleep(1)
-        self.adb.key_event(4)  # back from detail to storage
-        time.sleep(1)
+        if not self._abort and not self.nav.navigate_to_storage():
+            raise RuntimeError("Pass ended but storage could not be confirmed")
 
         return sm.count
 
@@ -200,44 +233,33 @@ class MultiPassScanner:
         """Clear any existing search filter and enter a new one.
 
         The storage search bar might have an old filter from the previous pass.
-        We need to: tap the X button to clear → tap search → type new query → enter.
+        Route through GameNavigator so calibrated tablet targets are used.  The
+        former duplicate implementation scaled Fold coordinates directly and
+        missed the tablet search bar.
         """
-        r = self.nav.r
-        w, h = r.screen_width, r.screen_height
-        sx = w / 968
-        sy = h / 2376
+        self.nav.enter_search(query)
 
-        # First check if search is active (the search bar shows text + X button)
-        # The X clear button is at the right end of the search bar
-        # Tap it to clear the filter
-        x_btn_x = int(920 * sx)
-        x_btn_y = int(300 * sy)
-        log.info("Clearing search filter...")
-        self.adb.tap(x_btn_x, x_btn_y, jitter=3)
-        human_delay(0.5, 0.1)
+    def _prepare_first_appraisal(self, search_query: str) -> bool:
+        """Open and verify the first appraisal before starting OCR."""
+        self.nav.tap_first_pokemon()
+        if self._abort:
+            return False
 
-        # Tap the search bar if the X didn't open it
-        # (if no search was active, tapping the X area does nothing,
-        #  so tap the search bar proper)
-        search_x = int(484 * sx)
-        search_y = int(300 * sy)
-        self.adb.tap(search_x, search_y, jitter=3)
-        human_delay(1.0, 0.2)
+        screen = self.nav.detect_screen()
+        if screen == "detail":
+            self.nav.open_first_appraisal()
+            if self._abort:
+                return False
+            screen = self.nav.detect_screen()
 
-        # Clear any remaining text
-        self.adb.shell("input keyevent 123")  # MOVE_END
-        time.sleep(0.1)
-        for _ in range(40):
-            self.adb.shell("input keyevent 67")  # DEL
-        time.sleep(0.2)
+        if screen == "appraisal":
+            return True
 
-        # Type the new query
-        self.adb.input_text(query)
-        human_delay(0.5, 0.1)
-
-        # Apply
-        self.adb.key_event(66)  # ENTER
-        human_delay(2.0, 0.5)
+        log.warning(
+            "First Pokemon did not reach appraisal (got %s); recovering",
+            screen,
+        )
+        return self.nav.navigate_to_appraisal(search_query or None)
 
     def _apply_tags_to_session(self, session_id: str, tags: dict):
         """Apply tags to ALL Pokemon in a scan session."""

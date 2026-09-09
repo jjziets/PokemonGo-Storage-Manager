@@ -1,5 +1,8 @@
 """Decision review panel — keep/transfer lists with manual overrides."""
 
+import html
+import time
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTreeWidget,
     QTreeWidgetItem, QPushButton, QLabel, QMessageBox, QGroupBox,
@@ -19,6 +22,14 @@ class DecisionReview(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pokemon_map: dict[int, Pokemon] = {}
+        self._fav_active = False
+        self._fav_dry_run = False
+        self._fav_action = "Favoriting"
+        self._fav_last_error = None
+        self._fav_paused_at = None
+        self._fav_paused_total = 0.
+        self._fav_last_progress = 0
+        self._fav_stopping = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -34,6 +45,7 @@ class DecisionReview(QWidget):
         self.run_engine_btn.setStyleSheet(
             "QPushButton { background-color: #2a5a7a; padding: 6px 12px; font-weight: bold; }"
         )
+        self.run_engine_btn.setToolTip("Apply the selected keep rules to the stored scan stats.")
         top_bar.addWidget(self.run_engine_btn)
 
         self.unfavorite_btn = QPushButton("Unfavorite All")
@@ -45,14 +57,20 @@ class DecisionReview(QWidget):
         self.approve_btn.setStyleSheet(
             "QPushButton { background-color: #4a5a2a; padding: 6px 12px; font-weight: bold; }"
         )
-        self.approve_btn.setToolTip("Test run — shows which would be favorited")
+        self.approve_btn.setToolTip(
+            "Dry run: read appraisal HP and IVs first, then verify species/form, CP and flags "
+            "against stored keeper stats. Nicknames do not determine matches."
+        )
         top_bar.addWidget(self.approve_btn)
 
         self.favorite_real_btn = QPushButton("Fav Keepers (REAL)")
         self.favorite_real_btn.setStyleSheet(
             "QPushButton { background-color: #7a6a2a; padding: 6px 12px; font-weight: bold; }"
         )
-        self.favorite_real_btn.setToolTip("Actually tap the star on matching keepers")
+        self.favorite_real_btn.setToolTip(
+            "Read appraisal HP and IVs first, then favorite only keepers whose species/form, "
+            "CP and flags match the stored stats. Nicknames do not determine matches."
+        )
         top_bar.addWidget(self.favorite_real_btn)
 
         top_bar.addStretch()
@@ -66,6 +84,8 @@ class DecisionReview(QWidget):
         self.rule_checks = {}
         rule_defs = [
             ("BEST_OVERALL",  "Best Overall",  True),
+            ("KEEP_PERFECT_IV", "All 100% IVs", True),
+            ("BEST_CP",       "Highest CP",    True),
             ("BEST_SHINY",    "Best Shiny",    True),
             ("BEST_SHADOW",   "Best Shadow",   True),
             ("BEST_DYNAMAX",  "Best Dynamax",  True),
@@ -76,6 +96,15 @@ class DecisionReview(QWidget):
         for rule_id, label, default in rule_defs:
             cb = QCheckBox(label)
             cb.setChecked(default)
+            if rule_id == "KEEP_PERFECT_IV":
+                cb.setToolTip(
+                    "Keep every exact 15/15/15 Pokémon, including duplicates. "
+                    "Uncheck to disable this rule."
+                )
+            elif rule_id == "BEST_CP":
+                cb.setToolTip(
+                    "Keep the highest current CP per species/form alongside the best IV and PvP picks."
+                )
             self.rule_checks[rule_id] = cb
             rules_bar1.addWidget(cb)
 
@@ -148,6 +177,8 @@ class DecisionReview(QWidget):
         fav_ctrl_layout = QHBoxLayout()
         fav_ctrl_layout.setSpacing(4)
         self.fav_status_label = QLabel("")
+        self.fav_status_label.setTextFormat(Qt.PlainText)
+        self.fav_status_label.setWordWrap(True)
         self.fav_status_label.setStyleSheet("font-weight: bold; color: #fc8;")
         fav_ctrl_layout.addWidget(self.fav_status_label)
         fav_ctrl_layout.addStretch()
@@ -307,36 +338,90 @@ class DecisionReview(QWidget):
     def get_transfer_count(self) -> int:
         return sum(1 for p in self._pokemon_map.values() if p.decision == "TRANSFER")
 
-    def set_favoriting(self, active: bool, dry_run: bool = False):
-        """Show/hide favorite progress controls."""
+    def set_favoriting(self, active: bool, dry_run: bool = False, action: str = "Favoriting"):
+        """Start or release the initiating action's controls after worker cleanup."""
+        self._fav_active = active
         self.fav_progress_bar.setVisible(active)
         self.fav_pause_btn.setVisible(active)
         self.fav_stop_btn.setVisible(active)
-        self.fav_log.setVisible(active)
+        self.fav_log.setVisible(active or bool(self.fav_log.toPlainText()))
         self.approve_btn.setEnabled(not active)
         self.favorite_real_btn.setEnabled(not active)
         self.run_engine_btn.setEnabled(not active)
         self.unfavorite_btn.setEnabled(not active)
 
         if active:
+            self._fav_dry_run = dry_run
+            self._fav_action = action
+            self._fav_last_error = None
+            self._fav_paused_at = None
+            self._fav_paused_total = 0.
+            self._fav_last_progress = 0
+            self._fav_stopping = False
             self.fav_log.clear()
+            self.fav_progress_bar.setRange(0, 0)
             self.fav_progress_bar.setValue(0)
+            self.fav_progress_bar.setFormat("Starting...")
             self.fav_pause_btn.setText("Pause")
+            self.fav_pause_btn.setEnabled(True)
+            self.fav_stop_btn.setEnabled(True)
             mode = "DRY RUN" if dry_run else "LIVE"
-            self.fav_status_label.setText(f"Favoriting ({mode})...")
+            self._fav_running_label = f"{action} ({mode})..."
+            self.fav_status_label.setText(self._fav_running_label)
             self.fav_status_label.setStyleSheet(
                 f"font-weight: bold; color: {'#8cf' if dry_run else '#fc8'};"
             )
-            import time
-            self._fav_start_time = time.time()
+            self._fav_start_time = time.monotonic()
+
+    def set_fav_paused(self, paused: bool):
+        if not self._fav_active or self._fav_stopping:
+            return
+        now = time.monotonic()
+        if paused and self._fav_paused_at is None:
+            self._fav_paused_at = now
+        elif not paused and self._fav_paused_at is not None:
+            self._fav_paused_total += now - self._fav_paused_at
+            self._fav_paused_at = None
+        self.fav_pause_btn.setText("Resume" if paused else "Pause")
+        self.fav_status_label.setText("Paused" if paused else self._fav_running_label)
+
+    def set_fav_stopping(self):
+        if not self._fav_active:
+            return
+        self._fav_stopping = True
+        self.fav_pause_btn.setEnabled(False)
+        self.fav_stop_btn.setEnabled(False)
+        self.fav_status_label.setText("Stopping...")
+
+    def _append_fav_log(self, message: str):
+        escaped = html.escape(str(message)).replace("\n", "<br>")
+        self.fav_log.append(f"<p>{escaped}</p>")
+        scrollbar = self.fav_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def on_fav_error(self, message: str):
+        if not self._fav_active:
+            return
+        self._fav_last_error = message
+        self.fav_status_label.setText(f"Error: {message}")
+        self.fav_status_label.setStyleSheet("font-weight: bold; color: #f88;")
+        self._append_fav_log(f"ERROR: {message}")
 
     def on_fav_progress(self, current: int, total: int, message: str):
         """Update favorite progress. current=checked, total=Pokemon in filter."""
-        self.fav_progress_bar.setMaximum(total if total > 0 else 10000)
+        if not self._fav_active:
+            return
+        self.fav_progress_bar.setRange(0, total if total > 0 else 0)
         self.fav_progress_bar.setValue(current)
 
-        import time
-        elapsed = time.time() - getattr(self, '_fav_start_time', time.time())
+        now = time.monotonic()
+        if current < self._fav_last_progress:
+            self._fav_start_time, self._fav_paused_total = now, 0.
+            if self._fav_paused_at is not None:
+                self._fav_paused_at = now
+        self._fav_last_progress = current
+        active_end = self._fav_paused_at if self._fav_paused_at is not None else now
+        elapsed = active_end - self._fav_start_time - self._fav_paused_total
         rate = current / elapsed if elapsed > 0 else 0
 
         if total > 0 and rate > 0:
@@ -348,22 +433,47 @@ class DecisionReview(QWidget):
             self.fav_progress_bar.setFormat(
                 f"{current} checked — {rate * 60:.0f}/min"
             )
-        self.fav_log.append(message)
-        scrollbar = self.fav_log.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        self._append_fav_log(message)
 
     def on_fav_finished(self, result: dict):
-        """Handle favorite completion."""
-        fav = result.get("favorited", 0)
-        checked = result.get("checked", 0)
-        dry = result.get("dry_run", False)
-        mode = "DRY RUN" if dry else "DONE"
-
-        self.fav_status_label.setText(
-            f"{mode}: {fav} favorited, {checked} checked"
-        )
-        self.fav_status_label.setStyleSheet("font-weight: bold; color: #8f8;")
+        """Keep the actual outcome visible after the worker has released resources."""
+        dry = self._fav_dry_run or result.get("dry_run", False)
+        counts = []
+        for key, value in result.items():
+            if type(value) is not int:
+                continue
+            label = key.replace("_", " ")
+            if dry and key in ("favorited", "unfavorited"):
+                label = "would favorite" if key == "favorited" else "would unfavorite"
+            counts.append(f"{label}: {value}")
+        needs_review = any(type(result.get(key)) is int and result[key] > 0
+                           for key in ("unmatched", "ambiguous", "unresolved"))
+        if "error" in result and result["error"] is not None:
+            error = result["error"] or "The action failed without an error message"
+            title = f"{'Dry run failed' if dry else 'Failed'} — {error}"
+            color = "#f88"
+        elif result.get("aborted"):
+            title, color = ("Dry run stopped" if dry else "Stopped"), "#fc8"
+        elif needs_review:
+            title = "Dry run complete — needs review" if dry else "Completed — needs review"
+            color = "#fc8"
+        elif self._fav_last_error is not None:
+            title = "Dry run complete with errors" if dry else "Completed with errors"
+            color = "#fc8"
+        elif dry:
+            title, color = "Dry run complete", "#8cf"
+        else:
+            title, color = "Done", "#8f8"
+        status = f"{title} — {', '.join(counts)}" if counts else title
+        if result.get("note"):
+            status += f"\n{result['note']}"
+        self.fav_status_label.setText(status)
+        self.fav_status_label.setStyleSheet(f"font-weight: bold; color: {color};")
+        self._append_fav_log(status)
         self.set_favoriting(False)
+        if self.fav_progress_bar.maximum() == 0:
+            self.fav_progress_bar.setRange(0, 1)
+        self.fav_progress_bar.setFormat(title)
         self.fav_progress_bar.setVisible(True)
         self.fav_status_label.setVisible(True)
         self.fav_log.setVisible(True)

@@ -24,17 +24,15 @@ class IVRanking:
 def compute_cp(base_atk: int, base_def: int, base_sta: int,
                iv_atk: int, iv_def: int, iv_sta: int, cpm: float) -> int:
     """Calculate Pokemon Go CP using the standard formula."""
-    atk = (base_atk + iv_atk) * cpm
-    def_ = (base_def + iv_def) * cpm
-    sta = (base_sta + iv_sta) * cpm
-    # Pokemon Go CP formula — use floor(), but handle floating point edge cases
-    # where the result is X.9999999... (should round up to X+1)
-    raw = atk * (def_ ** 0.5) * (sta ** 0.5) / 10
-    cp = int(raw)
-    # Only round up for true floating point artifacts (0.9999+, not 0.99x)
-    if raw - cp > 0.9999:
-        cp += 1
-    return max(10, cp)
+    # CP is floored even when it lies very close to the next integer. A
+    # blanket round-up threshold invents CP values for valid fractional results.
+    raw = (
+        (base_atk + iv_atk)
+        * math.sqrt(base_def + iv_def)
+        * math.sqrt(base_sta + iv_sta)
+        * cpm ** 2 / 10
+    )
+    return max(10, math.floor(raw))
 
 
 def compute_stat_product(base_atk: int, base_def: int, base_sta: int,

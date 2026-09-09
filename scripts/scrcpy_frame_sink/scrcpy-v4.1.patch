@@ -1,0 +1,120 @@
+diff --git a/app/meson.build b/app/meson.build
+index 8816426..80f5336 100644
+--- a/app/meson.build
++++ b/app/meson.build
+@@ -27,6 +27,7 @@ src = [
+     'src/opengl.c',
+     'src/options.c',
+     'src/packet_merger.c',
++    'src/pokemgr_frame_sink.c',
+     'src/receiver.c',
+     'src/recorder.c',
+     'src/scrcpy.c',
+@@ -127,9 +128,14 @@ dependencies = [
+     dependency('libavcodec', version: '>= 57.37', static: static),
+     dependency('libavutil', static: static),
+     dependency('libswresample', static: static),
++    dependency('libswscale', static: static),
+     dependency('sdl3', version: '>= 3.2.0', static: static),
+ ]
+ 
++if host_machine.system() == 'darwin'
++    dependencies += dependency('appleframeworks', modules: ['Accelerate'])
++endif
++
+ if v4l2_support
+     dependencies += dependency('libavdevice', static: static)
+ endif
+diff --git a/app/src/scrcpy.c b/app/src/scrcpy.c
+index f5b644a..4a09ba9 100644
+--- a/app/src/scrcpy.c
++++ b/app/src/scrcpy.c
+@@ -22,6 +22,7 @@
+ #include "file_pusher.h"
+ #include "keyboard_sdk.h"
+ #include "mouse_sdk.h"
++#include "pokemgr_frame_sink.h"
+ #include "recorder.h"
+ #include "screen.h"
+ #include "sdl_hints.h"
+@@ -56,6 +57,7 @@ struct scrcpy {
+     struct sc_demuxer audio_demuxer;
+     struct sc_decoder video_decoder;
+     struct sc_decoder audio_decoder;
++    struct sc_pk_frame_sink pk_frame_sink;
+     struct sc_recorder recorder;
+     struct sc_video_regulator video_regulator;
+ #ifdef HAVE_V4L2
+@@ -340,6 +342,25 @@ scrcpy(struct scrcpy_options *options) {
+     bool file_pusher_initialized = false;
+     bool recorder_initialized = false;
+     bool recorder_started = false;
++    bool pk_frame_sink_initialized = false;
++    const char *pk_frame_path = getenv("POKEMGR_FRAME_BUFFER");
++    const char *pk_frame_nonce = getenv("POKEMGR_FRAME_SESSION");
++    if ((pk_frame_path || pk_frame_nonce)
++            && (!pk_frame_path || !pk_frame_nonce || !options->video)) {
++        LOGE("Pokemon frame export requires both environment settings and video");
++        return SCRCPY_EXIT_FAILURE;
++    }
++    /* Synthetic encoder repeats advance PTS without capturing a new surface.
++     * Exported PTS must preserve source freshness for scanner gestures. Both
++     * Android 16 ACodec and CCodec skip repeat configuration when this is zero.
++     * Restrict codec overrides so timelapse/offset settings cannot retime it. */
++    const char *pk_codec_options = "repeat-previous-frame-after:long=0";
++    if (pk_frame_path && options->video_codec_options
++            && strcmp(options->video_codec_options, pk_codec_options)) {
++        LOGE("Pokemon frame export requires unmodified source timestamps; "
++             "custom video codec options are unsupported");
++        return SCRCPY_EXIT_FAILURE;
++    }
+ #ifdef HAVE_V4L2
+     bool v4l2_sink_initialized = false;
+ #endif
+@@ -395,7 +416,8 @@ scrcpy(struct scrcpy_options *options) {
+         .audio_dup = options->audio_dup,
+         .show_touches = options->show_touches,
+         .stay_awake = options->stay_awake,
+-        .video_codec_options = options->video_codec_options,
++        .video_codec_options = pk_frame_path ? pk_codec_options
++                                           : options->video_codec_options,
+         .audio_codec_options = options->audio_codec_options,
+         .video_encoder = options->video_encoder,
+         .audio_encoder = options->audio_encoder,
+@@ -545,7 +567,7 @@ scrcpy(struct scrcpy_options *options) {
+                         &audio_demuxer_cbs, options);
+     }
+ 
+-    bool needs_video_decoder = options->video_playback;
++    bool needs_video_decoder = options->video_playback || pk_frame_path;
+     bool needs_audio_decoder = options->audio_playback;
+ #ifdef HAVE_V4L2
+     needs_video_decoder |= !!options->v4l2_device;
+@@ -829,6 +851,16 @@ aoa_complete:
+     }
+ #endif
+ 
++    if (pk_frame_path) {
++        if (!sc_pk_frame_sink_init(&s->pk_frame_sink, pk_frame_path,
++                                   pk_frame_nonce)) {
++            goto end;
++        }
++        pk_frame_sink_initialized = true;
++        sc_frame_source_add_sink(&s->video_decoder.frame_source,
++                                  &s->pk_frame_sink.frame_sink);
++    }
++
+     // Now that the header values have been consumed, the socket(s) will
+     // receive the stream(s). Start the demuxer(s).
+ 
+@@ -970,6 +1002,10 @@ end:
+         sc_demuxer_join(&s->audio_demuxer);
+     }
+ 
++    if (pk_frame_sink_initialized) {
++        sc_pk_frame_sink_destroy(&s->pk_frame_sink);
++    }
++
+ #ifdef HAVE_V4L2
+     if (v4l2_sink_initialized) {
+         sc_v4l2_sink_destroy(&s->v4l2_sink);

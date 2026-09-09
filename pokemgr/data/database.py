@@ -87,9 +87,31 @@ class PokemonDatabase:
                 value TEXT
             );
         """)
-        # Indexes for dedup lookups and common queries
+        # A scan position is the durable identity of a row within one session.
+        # Older databases may contain more than one row for the same position
+        # because writes used to deduplicate globally by the Pokemon's stats.
+        # Keep the most recently inserted retry before installing the unique
+        # index so opening an existing database is migration-safe.
+        migrated = self.conn.execute(
+            """DELETE FROM pokemon
+               WHERE scan_session_id IS NOT NULL
+                 AND id NOT IN (
+                     SELECT MAX(id)
+                     FROM pokemon
+                     WHERE scan_session_id IS NOT NULL
+                     GROUP BY scan_session_id, position
+                 )"""
+        ).rowcount
+        if migrated > 0:
+            log.info(
+                "Migration removed %d duplicate session-position scan rows",
+                migrated,
+            )
+
+        self.conn.execute("DROP INDEX IF EXISTS idx_pokemon_dedup")
         self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_pokemon_dedup ON pokemon (species, cp, atk, def_, sta, hp)"
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_pokemon_session_position
+               ON pokemon (scan_session_id, position)"""
         )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pokemon_session ON pokemon (scan_session_id)"
@@ -97,9 +119,10 @@ class PokemonDatabase:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pokemon_species ON pokemon (species)"
         )
-        # Set schema version
+        # Set/update schema version after all migrations complete.
         self.conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')"
+            """INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value"""
         )
         self.conn.commit()
 
@@ -122,54 +145,44 @@ class PokemonDatabase:
     # ── Insert ───────────────────────────────────────────────────────
 
     def insert_pokemon(self, p: PokemonRead, session_id: str, position: int) -> int:
-        """Insert a scanned Pokemon, deduplicating by species + CP + IVs + HP.
+        """Insert or update the Pokemon scanned at a session position.
 
-        If a matching Pokemon already exists, updates it with the latest scan data.
-        Returns the Pokemon's row ID (existing or new).
+        Re-reading the same position in the same session updates that row and
+        returns its existing ID. Identical Pokemon at different positions (or
+        in different sessions) remain separate rows.
         """
         iv_total = p.atk + p.def_ + p.sta
         iv_pct = iv_total / 45.0
         hp = getattr(p, 'hp', -1)
 
-        # Check for existing duplicate (uses idx_pokemon_dedup index)
-        existing = self.conn.execute(
-            """SELECT id FROM pokemon
-               WHERE species = ? AND cp = ? AND atk = ? AND def_ = ? AND sta = ? AND hp = ?
-               LIMIT 1""",
-            (p.species, p.cp, p.atk, p.def_, p.sta, hp),
-        ).fetchone()
-
-        if existing:
-            row_id = existing[0]
-            self.conn.execute(
-                """UPDATE pokemon SET
-                       display_name = ?, shiny = ?, shadow = ?, lucky = ?, favorited = ?,
-                       gender = ?, weight_tag = ?, height_tag = ?, is_dynamax = ?,
-                       position = ?, screenshot_path = ?, confidence = ?,
-                       scan_session_id = ?, indexed_at = CURRENT_TIMESTAMP
-                   WHERE id = ?""",
-                (
-                    getattr(p, 'display_name', p.species),
-                    int(p.shiny), int(p.shadow), int(p.lucky), int(p.favorited),
-                    getattr(p, 'gender', 'none'),
-                    getattr(p, 'weight_tag', ''),
-                    getattr(p, 'height_tag', ''),
-                    int(getattr(p, 'is_dynamax', False)),
-                    position, p.screenshot_path, p.confidence, session_id,
-                    row_id,
-                ),
-            )
-            self._maybe_commit()
-            log.debug("Dedup: updated existing Pokemon id=%d (%s CP%d)", row_id, p.species, p.cp)
-            return row_id
-
-        cursor = self.conn.execute(
+        self.conn.execute(
             """INSERT INTO pokemon
                (species, display_name, cp, atk, def_, sta, iv_total, iv_pct,
                 shiny, shadow, lucky, favorited, gender,
                 weight_tag, height_tag, is_dynamax, hp,
                 position, screenshot_path, confidence, scan_session_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(scan_session_id, position) DO UPDATE SET
+                   species = excluded.species,
+                   display_name = excluded.display_name,
+                   cp = excluded.cp,
+                   atk = excluded.atk,
+                   def_ = excluded.def_,
+                   sta = excluded.sta,
+                   iv_total = excluded.iv_total,
+                   iv_pct = excluded.iv_pct,
+                   shiny = excluded.shiny,
+                   shadow = excluded.shadow,
+                   lucky = excluded.lucky,
+                   favorited = excluded.favorited,
+                   gender = excluded.gender,
+                   weight_tag = excluded.weight_tag,
+                   height_tag = excluded.height_tag,
+                   is_dynamax = excluded.is_dynamax,
+                   hp = excluded.hp,
+                   screenshot_path = excluded.screenshot_path,
+                   confidence = excluded.confidence,
+                   indexed_at = CURRENT_TIMESTAMP""",
             (
                 p.species, getattr(p, 'display_name', p.species),
                 p.cp, p.atk, p.def_, p.sta, iv_total, iv_pct,
@@ -182,8 +195,14 @@ class PokemonDatabase:
                 position, p.screenshot_path, p.confidence, session_id,
             ),
         )
+        row = self.conn.execute(
+            """SELECT id FROM pokemon
+               WHERE scan_session_id = ? AND position = ?""",
+            (session_id, position),
+        ).fetchone()
+        row_id = row[0]
         self._maybe_commit()
-        return cursor.lastrowid
+        return row_id
 
     # ── Queries ──────────────────────────────────────────────────────
 
@@ -376,16 +395,21 @@ class PokemonDatabase:
         log.info("Exported %d Pokemon to %s", len(pokemon), path)
 
     def remove_duplicates(self) -> int:
-        """Remove duplicate Pokemon, keeping the one with the highest id (latest scan).
+        """Remove retry-collisions at one position in one scan session.
 
-        Duplicates are defined as same species + CP + IVs (atk/def/sta) + HP.
+        Identical Pokemon at different positions are distinct collection rows and
+        must never be removed. Databases with the unique session-position index
+        will normally have no collisions; this remains as a legacy repair path.
         Returns the number of rows deleted.
         """
         cursor = self.conn.execute(
-            """DELETE FROM pokemon WHERE id NOT IN (
-                   SELECT MAX(id) FROM pokemon
-                   GROUP BY species, cp, atk, def_, sta, hp
-               )"""
+            """DELETE FROM pokemon
+               WHERE scan_session_id IS NOT NULL
+                 AND id NOT IN (
+                     SELECT MAX(id) FROM pokemon
+                     WHERE scan_session_id IS NOT NULL
+                     GROUP BY scan_session_id, position
+                 )"""
         )
         deleted = cursor.rowcount
         self.conn.commit()
