@@ -1,6 +1,7 @@
 """Background workers for ADB operations (run in QThread to keep GUI responsive)."""
 
 import logging
+import threading
 from PySide6.QtCore import QThread, Signal
 
 from ..adb.controller import ADBController
@@ -24,6 +25,7 @@ class ScanWorker(QThread):
     status = Signal(str)
     finished = Signal(int)
     error = Signal(str)
+    failed = Signal(str)
     paused = Signal()  # emitted when scan auto-pauses (resume mismatch etc.)
 
     def __init__(self, adb: ADBController, profile: CalibrationProfile,
@@ -37,10 +39,13 @@ class ScanWorker(QThread):
         self.max_pokemon = max_pokemon
         self.selected_passes: list[dict] | None = None  # set by main window
         self._scanner: MultiPassScanner | None = None
+        self._abort_requested = False
 
     def run(self):
         try:
             ensure_dirs()
+            if self._abort_requested:
+                return
 
             self._scanner = MultiPassScanner(self.adb, self.profile, self.db)
             self._scanner.unfavorite_all = self.unfavorite
@@ -74,11 +79,14 @@ class ScanWorker(QThread):
             self._scanner.on_error = lambda m: self.error.emit(m)
 
             self._scanner.start()
-            self.finished.emit(self._scanner._total_count)
+            if not self._abort_requested:
+                self.finished.emit(self._scanner._total_count)
 
         except Exception as e:
             log.exception("Scan worker error")
-            self.error.emit(str(e))
+            message = str(e)
+            self.error.emit(message)
+            self.failed.emit(message)
 
     def pause(self):
         if self._scanner and self._scanner._current_sm:
@@ -90,12 +98,9 @@ class ScanWorker(QThread):
 
     def abort(self):
         """Force stop — sets abort flag on scanner AND current state machine."""
+        self._abort_requested = True
         if self._scanner:
-            self._scanner._abort = True
             self._scanner.abort()
-        # Also directly abort the state machine if running
-        if self._scanner and self._scanner._current_sm:
-            self._scanner._current_sm._abort = True
 
 
 class ScanFromCurrentWorker(QThread):
@@ -105,6 +110,7 @@ class ScanFromCurrentWorker(QThread):
     status = Signal(str)
     finished = Signal(int)
     error = Signal(str)
+    failed = Signal(str)
 
     def __init__(self, adb: ADBController, profile: CalibrationProfile,
                  db: PokemonDatabase, unfavorite: bool = False,
@@ -116,41 +122,69 @@ class ScanFromCurrentWorker(QThread):
         self.unfavorite = unfavorite
         self.max_pokemon = max_pokemon
         self._sm: IndexingStateMachine | None = None
+        self._abort_requested = False
 
     def run(self):
         try:
             ensure_dirs()
+            if self._abort_requested:
+                return
 
-            nav = GameNavigator(self.adb, self.profile.regions)
+            nav = GameNavigator(
+                self.adb,
+                self.profile.regions,
+                cancelled=lambda: self._abort_requested,
+            )
+            if not nav.clear_touch_protection():
+                return
+            import time
+            time.sleep(0.25)
+            if self._abort_requested:
+                return
             screen = nav.detect_screen()
             self.status.emit(f"Detected screen: {screen}")
 
             if screen == 'appraisal':
                 pass  # already on appraisal — start scanning
-            elif screen in ('other', 'detail'):
-                # Likely on detail screen — try to open appraisal
+            elif screen == 'detail':
+                # Confirmed detail screen — open appraisal.
                 self.status.emit("Opening appraisal from detail screen...")
-                nav.open_first_appraisal()
+                if not nav.open_first_appraisal():
+                    return
                 # Verify we got to appraisal
-                import time
                 time.sleep(0.5)
+                if self._abort_requested:
+                    return
                 screen2 = nav.detect_screen()
                 if screen2 != 'appraisal':
-                    self.error.emit(
+                    message = (
                         f"Failed to open appraisal (screen: {screen2}). "
                         f"Navigate to a Pokemon detail screen first."
                     )
-                    self.finished.emit(0)
+                    self.error.emit(message)
+                    self.failed.emit(message)
+                    return
+            elif screen in ('game_map', 'storage'):
+                self.status.emit("Navigating to the first appraisal...")
+                if not nav.navigate_to_appraisal():
+                    if self._abort_requested:
+                        return
+                    message = f"Could not reach appraisal from {screen}."
+                    self.error.emit(message)
+                    self.failed.emit(message)
                     return
             else:
-                self.error.emit(
+                message = (
                     f"Not on a Pokemon screen (detected: {screen}). "
                     f"Navigate to a Pokemon first."
                 )
-                self.finished.emit(0)
+                self.error.emit(message)
+                self.failed.emit(message)
                 return
 
             self.status.emit("Scanning from current position...")
+            if self._abort_requested:
+                return
             self._sm = IndexingStateMachine(self.adb, self.profile, self.db)
             self._sm.unfavorite_all = self.unfavorite
             self._sm.on_progress = lambda c, p: self.progress.emit(c, p)
@@ -160,11 +194,14 @@ class ScanFromCurrentWorker(QThread):
                 self._sm.max_count = self.max_pokemon
 
             self._sm.start(expected_total=self.max_pokemon or None)
-            self.finished.emit(self._sm.count)
+            if not self._abort_requested:
+                self.finished.emit(self._sm.count)
 
         except Exception as e:
             log.exception("Scan worker error")
-            self.error.emit(str(e))
+            message = str(e)
+            self.error.emit(message)
+            self.failed.emit(message)
 
     def pause(self):
         if self._sm:
@@ -175,11 +212,61 @@ class ScanFromCurrentWorker(QThread):
             self._sm.resume()
 
     def abort(self):
+        self._abort_requested = True
         if self._sm:
             self._sm.abort()
 
 
-class UnfavoriteWorker(QThread):
+class _ActionWorker(QThread):
+    """Pause/abort survive setup and every exit delivers a terminal result."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._executor = None
+        self._control_lock = threading.Lock()
+        self._abort_requested = False
+        self._pause_requested = False
+
+    def _attach_executor(self, executor):
+        with self._control_lock:
+            self._executor = executor
+            aborted = self._abort_requested
+            if aborted:
+                executor.abort()
+            elif self._pause_requested:
+                executor.pause()
+        if aborted:
+            executor._close_reader()
+        return not aborted
+
+    def _emit_result(self, result):
+        result = dict(result)
+        with self._control_lock:
+            if self._abort_requested:
+                result['aborted'] = True
+        self.finished.emit(result)
+
+    def pause(self):
+        with self._control_lock:
+            self._pause_requested = True
+            if self._executor:
+                self._executor.pause()
+
+    def resume(self):
+        with self._control_lock:
+            self._pause_requested = False
+            if self._executor:
+                self._executor.resume()
+
+    def abort(self):
+        with self._control_lock:
+            self._abort_requested = True
+            self._pause_requested = False
+            if self._executor:
+                self._executor.abort()
+
+
+class UnfavoriteWorker(_ActionWorker):
     """Unfavorites all Pokemon in the background."""
 
     progress = Signal(int, int, str)
@@ -193,24 +280,27 @@ class UnfavoriteWorker(QThread):
         self.profile = profile
         self.db = db
         self._executor: Executor | None = None
+        self._abort_requested = False
 
     def run(self):
+        result = {"unfavorited": 0}
         try:
-            self._executor = Executor(self.adb, self.profile, self.db)
+            if self._abort_requested:
+                return
+            if not self._attach_executor(Executor(self.adb, self.profile, self.db)):
+                return
             self._executor.on_progress = lambda cur, tot, msg: self.progress.emit(cur, tot, msg)
+            self._executor.on_error = lambda msg: self.error.emit(msg)
             result = self._executor.unfavorite_all()
-            self.finished.emit(result)
         except Exception as e:
             log.exception("Unfavorite worker error")
             self.error.emit(str(e))
-            self.finished.emit({"unfavorited": 0, "error": str(e)})
-
-    def abort(self):
-        if self._executor:
-            self._executor.abort()
+            result = {"unfavorited": 0, "error": str(e)}
+        finally:
+            self._emit_result(result)
 
 
-class FavoriteFilterWorker(QThread):
+class FavoriteFilterWorker(_ActionWorker):
     """Favorites all Pokemon matching a search filter (swipe through + star all)."""
 
     progress = Signal(int, int, str)   # (current, total, message)
@@ -225,39 +315,40 @@ class FavoriteFilterWorker(QThread):
         self.search_query = search_query
         self.label = label
         self._executor = None
+        self._abort_requested = False
 
     def run(self):
+        db = None
+        result = {"favorited": 0}
         try:
+            if self._abort_requested:
+                return
             from ..execution.executor import Executor
             from ..data.database import PokemonDatabase
 
             # We need a DB instance but won't do keeper matching
             db = PokemonDatabase()
-            self._executor = Executor(self.adb, self.profile, db)
+            if not self._attach_executor(Executor(self.adb, self.profile, db)):
+                return
             self._executor.on_progress = lambda cur, tot, msg: self.progress.emit(cur, tot, msg)
             self._executor.on_error = lambda msg: self.error.emit(msg)
 
             result = self._executor.favorite_by_filter(self.search_query, self.label)
-            self.finished.emit(result)
         except Exception as e:
             log.exception("FavoriteFilter worker error")
             self.error.emit(str(e))
-            self.finished.emit({"favorited": 0, "error": str(e)})
-
-    def pause(self):
-        if self._executor:
-            self._executor.pause()
-
-    def resume(self):
-        if self._executor:
-            self._executor.resume()
-
-    def abort(self):
-        if self._executor:
-            self._executor.abort()
+            result = {"favorited": 0, "error": str(e)}
+        finally:
+            try:
+                if db is not None:
+                    db.close()
+            except Exception as exc:
+                self.error.emit(str(exc))
+                result = {**result, "error": str(exc)}
+            self._emit_result(result)
 
 
-class FavoriteWorker(QThread):
+class FavoriteWorker(_ActionWorker):
     """Favorites all KEEP Pokemon in the background."""
 
     progress = Signal(int, int, str)   # (current, total, message)
@@ -274,31 +365,25 @@ class FavoriteWorker(QThread):
         self.dry_run = dry_run
         self.selected_passes = selected_passes
         self._executor: Executor | None = None
+        self._abort_requested = False
 
     def run(self):
+        result = {"favorited": 0, "checked": 0, "dry_run": self.dry_run}
         try:
-            self._executor = Executor(self.adb, self.profile, self.db)
+            if self._abort_requested:
+                return
+            if not self._attach_executor(Executor(self.adb, self.profile, self.db)):
+                return
             self._executor.on_progress = lambda cur, tot, msg: self.progress.emit(cur, tot, msg)
             self._executor.on_error = lambda msg: self.error.emit(msg)
 
             result = self._executor.favorite_keepers(
                 dry_run=self.dry_run, selected_passes=self.selected_passes
             )
-            self.finished.emit(result)
 
         except Exception as e:
             log.exception("Favorite worker error")
             self.error.emit(str(e))
-            self.finished.emit({"favorited": 0, "error": str(e)})
-
-    def pause(self):
-        if self._executor:
-            self._executor.pause()
-
-    def resume(self):
-        if self._executor:
-            self._executor.resume()
-
-    def abort(self):
-        if self._executor:
-            self._executor.abort()
+            result = {"favorited": 0, "error": str(e), "dry_run": self.dry_run}
+        finally:
+            self._emit_result({**result, "dry_run": self.dry_run})

@@ -23,7 +23,8 @@ from .main_window import MainWindow
 log = logging.getLogger(__name__)
 
 
-def run_gui():
+def run_gui(*, start_scan: bool = False, skip_first: int = 0,
+            resume_species: str = "", resume_cp: int = 0):
     """Launch the Pokemon Manager GUI."""
     app = QApplication(sys.argv)
     app.setApplicationName("Pokemon Go Storage Manager")
@@ -53,4 +54,11 @@ def run_gui():
 
     window = MainWindow()
     window.show()
+    if start_scan:
+        from functools import partial
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, partial(
+            window.start_default_scan, skip_first=skip_first,
+            resume_species=resume_species, resume_cp=resume_cp,
+        ))
     sys.exit(app.exec())

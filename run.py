@@ -36,29 +36,134 @@ def cmd_test_adb(args):
 
 
 def cmd_calibrate(args):
-    """Run calibration for the connected device."""
+    """Create, capture, or explicitly verify calibration evidence."""
     from pokemgr.adb.controller import ADBController
     from pokemgr.calibration.profile import CalibrationProfile
+    from pokemgr.calibration.evidence import (
+        confirm_calibration_evidence,
+        write_calibration_evidence,
+    )
 
     adb = ADBController()
     adb.connect()
     info = adb.get_device_info()
     print(f"Device: {info}")
 
-    # Check for existing profile
+    # Check for an existing profile before any file is replaced.
     profile = CalibrationProfile.find_for_device(info)
+    if args.confirm_verified:
+        if not profile:
+            print("No calibration found. Run 'calibrate' first.")
+            return
+        try:
+            known_truth = _parse_known_truth(args.known_truth)
+            confirm_calibration_evidence(
+                args.confirm_verified,
+                profile,
+                known_truth,
+                note=args.note,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Could not verify calibration: {exc}")
+            return
+        profile.save()
+        print("Calibration marked verified from known-truth evidence.")
+        print(f"Manifest: {args.confirm_verified}")
+        return
+
+    if getattr(args, "capture_evidence", False):
+        if not profile:
+            print("No calibration found. Run 'calibrate' first.")
+            return
+        if args.screenshot:
+            from PIL import Image
+            with Image.open(args.screenshot) as source_image:
+                image = source_image.copy()
+            capture_source = f"file:{Path(args.screenshot).resolve()}"
+        else:
+            image = adb.screencap()
+            capture_source = "adb_screencap"
+        try:
+            evidence = write_calibration_evidence(
+                profile,
+                image,
+                source=capture_source,
+                visible_screen=args.screen_label,
+                note=args.note,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Could not capture calibration evidence: {exc}")
+            return
+        profile.add_validation(evidence["validation_entry"])
+        profile.save()
+        print("Calibration evidence captured; verification status is unchanged.")
+        print(f"Evidence: {evidence['manifest_path']}")
+        return
+
     if profile:
         print(f"Found existing calibration from {profile.calibrated_at}")
+        print(
+            "Coordinates: "
+            f"{profile.metadata.get('coordinate_source', 'unspecified')}; "
+            "verification: "
+            f"{profile.metadata.get('verification_status', 'unverified')}"
+        )
         if not args.force:
-            print("Use --force to recalibrate")
+            print("Use --force to back it up and create a fresh template.")
             return
+        backup = CalibrationProfile.backup_for_device(info)
+        if not backup:
+            print("Could not back up the existing calibration; leaving it unchanged.")
+            return
+        print(f"Existing calibration backed up: {backup}")
 
-    # Create default profile based on resolution
+    # Defaults are only templates.  A screenshot and explicit known-truth scan
+    # are required before the profile can be called verified calibration.
     profile = CalibrationProfile.create_default(info)
-    profile.save()
-    print(f"Default calibration saved for {info.resolution}")
-    print("You'll need to tune the regions using the GUI or by editing the JSON.")
-    print(f"Profile: calibrations/{profile.fingerprint}.json")
+    if args.screenshot:
+        from PIL import Image
+        with Image.open(args.screenshot) as source_image:
+            image = source_image.copy()
+        capture_source = f"file:{Path(args.screenshot).resolve()}"
+    else:
+        image = adb.screencap()
+        capture_source = "adb_screencap"
+
+    try:
+        evidence = write_calibration_evidence(
+            profile,
+            image,
+            source=capture_source,
+            visible_screen=args.screen_label,
+            note=args.note,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Could not create calibration evidence: {exc}")
+        print("The existing profile was not replaced.")
+        return
+    profile.add_validation(evidence["validation_entry"])
+    profile_path = profile.save()
+    print(f"Unverified {profile.layout} template saved for {info.resolution}.")
+    print("The screenshot overlay is evidence, not proof that the targets work.")
+    print(f"Profile: {profile_path}")
+    print(f"Evidence: {evidence['manifest_path']}")
+
+
+def _parse_known_truth(values):
+    """Parse repeated ``Species=CP`` calibration truth arguments."""
+    parsed = []
+    for value in values or []:
+        species, separator, raw_cp = value.rpartition("=")
+        if not separator or not species.strip():
+            raise ValueError(f"Expected Species=CP, got {value!r}")
+        try:
+            cp = int(raw_cp)
+        except ValueError as exc:
+            raise ValueError(f"CP must be an integer in {value!r}") from exc
+        if cp <= 0:
+            raise ValueError(f"CP must be positive in {value!r}")
+        parsed.append({"species": species.strip(), "cp": cp})
+    return parsed
 
 
 def cmd_test_read(args):
@@ -90,10 +195,16 @@ def cmd_test_read(args):
     print(f"  Confidence: {detail['confidence']:.0%}")
 
     if args.appraise:
-        print("\nTapping appraise...")
-        adb.tap(*profile.regions.appraise_button)
-        import time
-        time.sleep(2)
+        from pokemgr.adb.navigator import GameNavigator
+        navigator = GameNavigator(adb, profile.regions)
+        screen = navigator.detect_screen(img)
+        if screen != "appraisal":
+            print("\nOpening appraisal...")
+            if screen == "detail":
+                navigator.open_first_appraisal()
+            elif not navigator.navigate_to_appraisal():
+                print(f"Could not reach appraisal from screen: {screen}")
+                return
 
         print("Reading appraisal screen...")
         img2 = adb.screencap()
@@ -104,7 +215,7 @@ def cmd_test_read(args):
         print(f"  Confidence: {appraisal['confidence']:.0%}")
 
         # Close appraisal
-        adb.tap(*profile.regions.close_appraisal_target)
+        adb.tap(*navigator.appraisal_close_target())
 
 
 def cmd_index(args):
@@ -175,7 +286,43 @@ def cmd_decide(args):
 def cmd_gui(args):
     """Launch the desktop GUI."""
     from pokemgr.gui.app import run_gui
-    run_gui()
+    run_gui(
+        start_scan=getattr(args, "start_scan", False),
+        skip_first=getattr(args, "skip_first", None) or 0,
+        resume_species=getattr(args, "resume_species", None) or "",
+        resume_cp=getattr(args, "resume_cp", None) or 0,
+    )
+
+
+def add_scan_start_arguments(parser):
+    """Share the explicit GUI start/resume options with the stream launcher."""
+    parser.add_argument("--start-scan", action="store_true",
+                        help="Connect and start all five scan passes with Unfavorite off")
+    parser.add_argument("--skip-first", type=int, metavar="N",
+                        help="Skip N saved positions on the first pass (requires --start-scan)")
+    parser.add_argument("--resume-species", metavar="NAME",
+                        help="Verify the first new Pokemon after --skip-first")
+    parser.add_argument("--resume-cp", type=int, metavar="CP",
+                        help="Verify the first new Pokemon's CP after --skip-first")
+
+
+def validate_scan_start_arguments(parser, args):
+    """Reject invalid resume intent before opening a GUI or touching a device."""
+    if (any(getattr(args, name) is not None
+            for name in ("skip_first", "resume_species", "resume_cp"))
+            and not args.start_scan):
+        parser.error("resume options require --start-scan")
+    if args.skip_first is not None and not 0 <= args.skip_first <= 10000:
+        parser.error("--skip-first must be between 0 and 10000")
+    if args.resume_cp is not None and not 1 <= args.resume_cp <= 10000:
+        parser.error("--resume-cp must be between 1 and 10000")
+    if args.resume_species is not None:
+        args.resume_species = args.resume_species.strip()
+        if not args.resume_species:
+            parser.error("--resume-species must not be empty")
+    if ((args.resume_species is not None or args.resume_cp is not None)
+            and not args.skip_first):
+        parser.error("a resume target requires --skip-first greater than zero")
 
 
 def main():
@@ -188,7 +335,35 @@ def main():
 
     # calibrate
     cal = sub.add_parser("calibrate", help="Calibrate for connected device")
-    cal.add_argument("--force", action="store_true", help="Force recalibration")
+    calibration_action = cal.add_mutually_exclusive_group()
+    calibration_action.add_argument(
+        "--force", action="store_true",
+        help="Back up the current profile and create a fresh template",
+    )
+    cal.add_argument(
+        "--screenshot", type=str,
+        help="Use this screenshot for evidence instead of a new ADB capture",
+    )
+    calibration_action.add_argument(
+        "--capture-evidence", action="store_true",
+        help="Capture an overlay for the existing profile without replacing it",
+    )
+    cal.add_argument(
+        "--screen-label", type=str, default="unknown",
+        help="Screen visible in the calibration capture (for example map or appraisal)",
+    )
+    cal.add_argument(
+        "--note", type=str, default="",
+        help="Operator note stored with calibration evidence",
+    )
+    calibration_action.add_argument(
+        "--confirm-verified", metavar="MANIFEST",
+        help="Mark existing calibration verified after a known-truth scan",
+    )
+    cal.add_argument(
+        "--known-truth", action="append", default=[], metavar="SPECIES=CP",
+        help="Known result from bounded validation; repeat at least twice",
+    )
 
     # test-read
     tr = sub.add_parser("test-read", help="Test screen reading")
@@ -206,9 +381,12 @@ def main():
     dec.add_argument("--export", type=str, default=None, help="Export CSV path")
 
     # gui
-    sub.add_parser("gui", help="Launch desktop GUI")
+    gui = sub.add_parser("gui", help="Launch desktop GUI")
+    add_scan_start_arguments(gui)
 
     args = parser.parse_args()
+    if args.command == "gui":
+        validate_scan_start_arguments(parser, args)
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(

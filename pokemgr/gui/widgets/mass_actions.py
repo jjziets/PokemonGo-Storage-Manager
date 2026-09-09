@@ -2,6 +2,7 @@
 
 import time
 import logging
+import html
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton,
     QLabel, QProgressBar, QTextEdit, QCheckBox, QGridLayout,
@@ -109,7 +110,8 @@ class MassActions(QWidget):
 
         keep_layout.addStretch()
 
-        keep_desc = QLabel("Uses species + IVs + HP to match keepers from the decision engine.")
+        keep_desc = QLabel("Matches validated species/form, CP, HP and IVs; names may be nicknames.")
+        keep_desc.setWordWrap(True)
         keep_desc.setStyleSheet("color: #888;")
         keep_layout.addWidget(keep_desc)
 
@@ -168,17 +170,54 @@ class MassActions(QWidget):
             btn.setEnabled(not active)
 
         if active:
+            self._last_error = ""
+            self._running_label = label
+            self._paused_at = None
+            self._paused_total = 0.
+            self._last_progress = 0
             self.action_log.clear()
+            self.progress_bar.setRange(0, 0)
             self.progress_bar.setValue(0)
             self.pause_btn.setText("Pause")
+            self.pause_btn.setEnabled(True)
+            self.stop_btn.setEnabled(True)
             self.status_label.setText(label)
-            self._start_time = time.time()
+            self.status_label.setStyleSheet("font-weight: bold; color: #fc8;")
+            self._start_time = time.monotonic()
+
+    def set_paused(self, paused: bool):
+        now = time.monotonic()
+        if paused and self._paused_at is None:
+            self._paused_at = now
+        elif not paused and self._paused_at is not None:
+            self._paused_total += now - self._paused_at
+            self._paused_at = None
+        self.pause_btn.setText("Resume" if paused else "Pause")
+        self.status_label.setText("Paused" if paused else self._running_label)
+
+    def set_stopping(self):
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText("Stopping...")
+
+    def on_error(self, message: str):
+        self._last_error = message
+        self.status_label.setText(f"Error: {message}")
+        self.status_label.setStyleSheet("font-weight: bold; color: #f88;")
+        self.action_log.append(html.escape(f"ERROR: {message}"))
 
     def on_progress(self, current: int, total: int, message: str):
-        self.progress_bar.setMaximum(total if total > 0 else 10000)
+        self.progress_bar.setRange(0, total if total > 0 else 0)
         self.progress_bar.setValue(current)
 
-        elapsed = time.time() - getattr(self, '_start_time', time.time())
+        now = time.monotonic()
+        if current < self._last_progress:
+            self._start_time, self._paused_total = now, 0.
+            if self._paused_at is not None:
+                self._paused_at = now
+        self._last_progress = current
+        active_end = self._paused_at if self._paused_at is not None else now
+        elapsed = active_end - self._start_time - self._paused_total
         rate = current / elapsed if elapsed > 0 else 0
 
         if total > 0 and rate > 0:
@@ -189,15 +228,38 @@ class MassActions(QWidget):
         else:
             self.progress_bar.setFormat(f"{current} — {rate * 60:.0f}/min")
 
-        self.action_log.append(message)
+        self.action_log.append(html.escape(message))
         scrollbar = self.action_log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
     def on_finished(self, result: dict):
-        msg = ", ".join(f"{k}: {v}" for k, v in result.items() if isinstance(v, int))
-        self.status_label.setText(f"Done — {msg}")
-        self.status_label.setStyleSheet("font-weight: bold; color: #8f8;")
+        msg = ", ".join(f"{('would favorite' if k == 'favorited' and result.get('dry_run') else k)}: {v}"
+                        for k, v in result.items() if type(v) is int)
+        needs_review = any(type(result.get(key)) is int and result[key] > 0
+                           for key in ('unmatched', 'ambiguous', 'unresolved'))
+        if result.get('error'):
+            title, color = f"Failed — {result['error']}", "#f88"
+        elif result.get('aborted'):
+            title, color = "Stopped", "#fc8"
+        elif needs_review:
+            title = "Dry run complete — needs review" if result.get('dry_run') else "Completed — needs review"
+            color = "#fc8"
+        elif result.get('dry_run'):
+            title, color = ("Dry run complete with errors", "#fc8") if getattr(self, '_last_error', '') else ("Dry run complete", "#8cf")
+        elif getattr(self, '_last_error', ''):
+            title, color = "Completed with errors", "#fc8"
+        else:
+            title, color = "Done", "#8f8"
+        status = f"{title} — {msg}" if msg else title
+        if result.get('note'):
+            status += f"\n{result['note']}"
+        self.status_label.setText(status)
+        self.status_label.setStyleSheet(f"font-weight: bold; color: {color};")
+        self.action_log.append(html.escape(self.status_label.text()))
         self.set_running(False)
+        if self.progress_bar.maximum() == 0:
+            self.progress_bar.setRange(0, 1)
+        self.progress_bar.setFormat(title)
         # Keep log visible
         self.progress_bar.setVisible(True)
         self.status_label.setVisible(True)

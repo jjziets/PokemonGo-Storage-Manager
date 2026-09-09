@@ -2,16 +2,19 @@
 
 import re
 import logging
+from collections.abc import Collection
 import cv2
 import numpy as np
 import pytesseract
 from PIL import Image
 
-from ..calibration.regions import BBox
+from ..calibration.regions import BBox, is_tablet_layout
+from .. import timing
 
 log = logging.getLogger(__name__)
 
 
+@timing.timed("reader.name")
 def read_species_name(image: Image.Image, region: BBox) -> tuple[str, float]:
     """Read the Pokemon species name from the detail screen.
 
@@ -42,45 +45,171 @@ def read_species_name(image: Image.Image, region: BBox) -> tuple[str, float]:
     return name, confidence
 
 
-def read_cp(image: Image.Image, region: BBox) -> tuple[int, float]:
+@timing.timed("reader.cp")
+def read_cp(image: Image.Image, region: BBox, *,
+            expected_cps: Collection[int] | None = None,
+            fast: bool = False) -> tuple[int, float]:
     """Read the CP value from the detail screen.
 
     CP is white text on a gradient/colored background.
     Returns (cp_value, confidence). Returns (-1, 0.0) on failure.
+
+    Recovery may supply exact CP candidates from already confirmed identity
+    evidence. In that mode all Tesseract variants must agree on at most one
+    observed candidate; no missing digits or font substitutions are inferred.
+    ``fast`` limits an unconstrained primary read to grayscale PSM 8 so the
+    scanner can try HP/IV calculation before spending time on OCR recovery.
+    Exact-candidate recovery always remains exhaustive, regardless of ``fast``.
     """
     crop = np.array(image.crop(region.as_tuple()))
 
     # Fast path: Tesseract first (~10ms)
     scale = 5
     crop_5x = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    crop_rgb = crop_5x[:, :, :3] if crop_5x.shape[2] == 4 else crop_5x
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
     white_mask = np.all(crop_5x > 200, axis=2).astype(np.uint8) * 255
 
+    if expected_cps is not None:
+        expected = frozenset(expected_cps)
+        if not expected:
+            return -1, 0.0
+        observed: dict[int, float] = {}
+
+        def observe_exact(text, confidence):
+            # Require the entire CP token. In particular, do not take a
+            # suffix from a five-digit OCR run, join separated fragments, or
+            # repair A to 4 merely because that would fit an expected value.
+            match = re.fullmatch(
+                r"(?:c?p\s*)?([1-9][0-9]{1,3})", text.strip(), re.IGNORECASE,
+            )
+            if match:
+                cp = int(match.group(1))
+                if cp in expected:
+                    observed[cp] = max(confidence, observed.get(cp, 0.0))
+
+        for prepared, psm, confidence in (
+            (gray, 8, 0.8), (gray, 7, 0.75),
+            (white_mask, 8, 0.72), (white_mask, 7, 0.68),
+        ):
+            observe_exact(
+                pytesseract.image_to_string(prepared, config=f"--psm {psm}"),
+                confidence,
+            )
+
+        if len(observed) > 1:
+            log.warning("Conflicting exact CP observations: %s", sorted(observed))
+            return -1, 0.0
+        if not observed:
+            # The numeric Paddle helper concatenates digit fragments. Parse
+            # its raw text instead, under the same whole-token requirement.
+            try:
+                from .ocr_engine import read_text_paddle
+                paddle_rgb = crop[:, :, :3] if crop.shape[2] == 4 else crop
+                observe_exact(read_text_paddle(paddle_rgb), 0.9)
+            except Exception as exc:
+                log.debug("Exact CP Paddle fallback failed: %s", exc)
+        if observed:
+            cp, confidence = next(iter(observed.items()))
+            log.debug("CP via exact recovery observations: %d", cp)
+            return cp, confidence
+        return -1, 0.0
+
+    # The CP crop is a single visual token.  PSM 7 (single line) can clip the
+    # last digit on wide tablet frames (for example CP567 -> CP56), while PSM 8
+    # reads the same mask correctly and remains accurate on narrow phones.
+    def _parse_cp_digits(text: str) -> str:
+        """Repair the evidenced Pokemon Go font confusion before parsing.
+
+        Tesseract reads the thin middle 4 in ``CP747`` as ``CP7A7``.  A full
+        digit whitelist is unsafe because it can reinterpret the literal
+        ``CP`` label as ``61`` (CP1333 -> 61333).  Only repair an A between two
+        digits, which targets the exact evidenced pattern without promoting a
+        partial transition such as ``A7`` to a plausible CP47.
+        """
+        repaired = re.sub(r"(?i)(?<=\d)a(?=\d)", "4", text)
+        compact = re.sub(r"\s+", "", repaired)
+
+        # Prefer digits explicitly following the CP/P label, but retain a
+        # digits-only fallback for OCR engines that omit that label entirely.
+        labelled = re.search(r"(?i)c?p([0-9]+)", compact)
+        if labelled and 2 <= len(labelled.group(1)) <= 4:
+            return labelled.group(1)
+
+        # Never concatenate separate digit runs across OCR noise.  For example
+        # ``-6p1333`` contains a stray 6 plus the real CP1333; stripping every
+        # non-digit would manufacture CP61333.  A raw five-digit run is also
+        # rejected so the independent PSM/fallback gets a turn.
+        valid_runs = [run for run in re.findall(r"[0-9]+", repaired)
+                      if 2 <= len(run) <= 4]
+        if not valid_runs:
+            return ""
+        return max(valid_runs,
+                   key=lambda run: (len(run), repaired.rfind(run)))
+
+    # Preserve grayscale contrast before trying a hard white mask.  Bright
+    # appraisal backgrounds can merge a real digit with a nearby bokeh circle
+    # in the mask (the live CP369 frame became CP3869), while grayscale reads
+    # the same visible glyphs as 369.
     full_text = pytesseract.image_to_string(
-        white_mask, config="--psm 7"
+        gray, config="--psm 8"
     ).strip()
 
-    digits = re.sub(r"[^0-9]", "", full_text)
+    digits = _parse_cp_digits(full_text)
     if digits:
         cp = int(digits)
-        log.debug("CP via Tesseract (fast): %d", cp)
-        return cp, 0.8
+        if cp >= 10:
+            log.debug("CP via Tesseract (fast): %d", cp)
+            return cp, 0.8
+        log.debug("Rejected one-digit CP candidate: %d", cp)
+
+    if fast:
+        return -1, 0.0
+
+    # Preserve compatibility with unusually spaced/narrow phone crops where
+    # Tesseract's single-line segmentation can still outperform single-word.
+    line_text = pytesseract.image_to_string(
+        gray, config="--psm 7"
+    ).strip()
+    digits = _parse_cp_digits(line_text)
+    if digits:
+        cp = int(digits)
+        if cp >= 10:
+            log.debug("CP via Tesseract (line fallback): %d", cp)
+            return cp, 0.75
+        log.debug("Rejected one-digit CP line candidate: %d", cp)
+
+    # Hard-mask fallback remains useful on low-contrast or very busy
+    # backgrounds where grayscale segmentation cannot isolate the white text.
+    for psm, confidence in ((8, 0.72), (7, 0.68)):
+        masked_text = pytesseract.image_to_string(
+            white_mask, config=f"--psm {psm}"
+        ).strip()
+        digits = _parse_cp_digits(masked_text)
+        if digits:
+            cp = int(digits)
+            if cp >= 10:
+                log.debug("CP via white-mask fallback: %d", cp)
+                return cp, confidence
 
     # Slow path: PaddleOCR fallback (~250ms, better accuracy)
     try:
         from .ocr_engine import read_number_paddle
-        crop_rgb = crop[:, :, :3] if crop.shape[2] == 4 else crop
-        paddle_cp = read_number_paddle(crop_rgb)
-        if paddle_cp > 0:
+        paddle_rgb = crop[:, :, :3] if crop.shape[2] == 4 else crop
+        paddle_cp = read_number_paddle(paddle_rgb)
+        if paddle_cp >= 10:
             log.debug("CP via PaddleOCR (fallback): %d", paddle_cp)
             return paddle_cp, 0.9
     except Exception:
         pass
 
-    log.warning("Failed to read CP from text: '%s'", full_text)
+    log.warning("Failed to read CP from text: word='%s' line='%s'", full_text, line_text)
     return -1, 0.0
 
 
-def read_caught_species(image: Image.Image, screen_width: int, screen_height: int) -> str:
+@timing.timed("reader.caught_species")
+def read_caught_species(image: Image.Image, screen_width: int, screen_height: int,
+                        density: int | None = None) -> str:
     """Read the real species name from the professor's speech bubble.
 
     The bubble says 'This [Species] was caught on [date]...'
@@ -90,11 +219,58 @@ def read_caught_species(image: Image.Image, screen_width: int, screen_height: in
     arr = np.array(image)
     w, h = image.size
 
-    # Crop the speech bubble area (bottom of screen)
-    bubble = arr[h - 220:h - 10, 20:w - 20]
+    # Crop the speech bubble area.  On wide tablets the bubble is much taller
+    # than on narrow phones; the old last-220px crop cut off "This <species>"
+    # and left only the location line.
+    is_tablet = is_tablet_layout(w, h, density)
+    # Current narrow-phone appraisal bubbles are also substantially taller
+    # than 220 px.  On the Fold cover screen, the old last-220px crop started
+    # below "This <species> was" and made authoritative species recovery
+    # impossible for large models whose CP is hidden.
+    bubble_start = int(h * (0.72 if is_tablet else 0.80))
+    bubble_end = int(h * 0.94) if is_tablet else h - 10
+    bubble = arr[bubble_start:bubble_end, 20:w - 20]
     if bubble.shape[2] == 4:
         bubble = bubble[:, :, :3]
     bubble = bubble.copy()  # ensure contiguous
+
+    def _extract_species(text: str) -> str:
+        # OCR can split the line as "This" + "s Abra was".  Tolerate one
+        # stray single-letter edge artifact but require both anchor words so
+        # appraisal labels cannot be mistaken for identity evidence.
+        match = re.search(
+            r"\bThis\s+(.{2,40}?)\s+was\b",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        candidate = re.sub(r"\s+", " ", match.group(1)).strip()
+        parts = candidate.split(" ")
+        if len(parts) > 1 and len(parts[0]) == 1 and parts[0].isalpha():
+            candidate = " ".join(parts[1:])
+        allowed_punctuation = set(" .'-:♀♂%’")
+        if not candidate or not all(
+                char.isalpha() or char.isdigit() or char in allowed_punctuation
+                for char in candidate):
+            return ""
+        return candidate
+
+    # This speech-bubble line is high contrast and Tesseract reads it reliably
+    # in a few milliseconds on the supplied tablet frames.  Make it the fast
+    # path; Paddle remains the fallback for unusual fonts or split detections.
+    try:
+        gray = cv2.cvtColor(bubble, cv2.COLOR_RGB2GRAY)
+        tesseract_text = pytesseract.image_to_string(
+            gray, config="--psm 11"
+        ).strip()
+        species = _extract_species(tesseract_text)
+        if species:
+            log.debug("Caught species via Tesseract: '%s' (text='%s')",
+                      species, tesseract_text)
+            return species
+    except Exception as e:
+        log.debug("Tesseract caught-species read failed: %s", e)
 
     try:
         from .ocr_engine import read_text_paddle
@@ -104,14 +280,18 @@ def read_caught_species(image: Image.Image, screen_width: int, screen_height: in
         if reader:
             result = reader.ocr(bubble)
             if result:
+                texts = []
                 for item in result:
                     if isinstance(item, dict) and 'rec_texts' in item:
-                        for text in item['rec_texts']:
-                            match = re.search(r'This\s+(\w+)', text, re.IGNORECASE)
-                            if match:
-                                species = match.group(1)
-                                log.debug("Caught species from bubble: '%s' (text='%s')", species, text)
-                                return species
+                        texts.extend(str(text) for text in item['rec_texts'] if text)
+
+                # Paddle can split the sentence into adjacent OCR items.
+                combined = " ".join(texts)
+                species = _extract_species(combined)
+                if species:
+                    log.debug("Caught species from bubble: '%s' (text='%s')",
+                              species, combined)
+                    return species
     except Exception as e:
         log.debug("Failed to read caught species: %s", e)
 
@@ -121,6 +301,7 @@ def read_caught_species(image: Image.Image, screen_width: int, screen_height: in
 _gym_template = None
 _gym_template_gray = None
 
+@timing.timed("reader.gym")
 def is_in_gym(image: Image.Image, screen_width: int, screen_height: int) -> bool:
     """Check if Pokemon is in a gym using template matching of the GO TO GYM button."""
     global _gym_template, _gym_template_gray
@@ -162,6 +343,7 @@ def is_in_gym(image: Image.Image, screen_width: int, screen_height: int) -> bool
     return False
 
 
+@timing.timed("reader.hp")
 def read_hp(image: Image.Image, screen_width: int, screen_height: int) -> int:
     """Read HP value from the appraisal/detail screen.
 
@@ -176,10 +358,16 @@ def read_hp(image: Image.Image, screen_width: int, screen_height: int) -> int:
     # Step 1: Find the HP bar dynamically (green = full HP, gray = depleted)
     arr = np.array(image)
     bar_y = -1
-    for y in range(int(900 * sy), int(1100 * sy)):
-        row = arr[y, int(300 * sx):int(650 * sx), :3]
-        # Green HP bar: R~80-140, G>220, B~160-200
-        green_mask = (row[:, 0] > 80) & (row[:, 0] < 140) & (row[:, 1] > 220) & (row[:, 2] > 160) & (row[:, 2] < 200)
+    h, w = arr.shape[:2]
+    for y in range(int(h * 0.35), int(h * 0.70)):
+        row = arr[y, int(w * 0.20):int(w * 0.80), :3]
+        # Green HP bar.  Appraisal overlays tint the normal 109/235/180 bar to
+        # roughly 160/226/156, so detect green dominance rather than a narrow
+        # absolute RGB range.
+        row_i = row.astype(np.int16)
+        green_mask = ((row_i[:, 1] > 200) &
+                      ((row_i[:, 1] - row_i[:, 0]) > 30) &
+                      ((row_i[:, 1] - row_i[:, 2]) > 30))
         if np.sum(green_mask) / len(green_mask) > 0.3:
             bar_y = y
             break
@@ -197,6 +385,38 @@ def read_hp(image: Image.Image, screen_width: int, screen_height: int) -> int:
 
     arr = np.array(image)
 
+    # Read the whole text line first.  A generous crop is more reliable on
+    # tablets than sliding short 25px windows, which can clip the top of a 3
+    # and turn e.g. 130 into 120.
+    line_crop = image.crop((
+        int(w * 0.25),
+        bar_y + max(10, int(h * 0.006)),
+        int(w * 0.75),
+        min(h, bar_y + max(80, int(h * 0.045))),
+    ))
+    line_gray = cv2.cvtColor(np.array(line_crop), cv2.COLOR_RGB2GRAY)
+    line_gray = cv2.resize(line_gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    _, line_binary = cv2.threshold(line_gray, 210, 255, cv2.THRESH_BINARY_INV)
+    line_text = pytesseract.image_to_string(line_binary, config="--psm 7").strip()
+    line_match = re.search(r'(\d{1,3})\s*/\s*(\d{2,3})\s*H\s*P', line_text, re.IGNORECASE)
+    if line_match:
+        max_hp = int(line_match.group(2))
+        if 10 <= max_hp <= 500:
+            log.debug("HP read (full line): %d (text='%s', bar_y=%d)", max_hp, line_text, bar_y)
+            return max_hp
+
+    # The appraisal tint can obscure the trailing "HP" while leaving a clear
+    # full-health value (for example "90/90").  This crop is anchored directly
+    # below a detected HP bar, so accepting equal repeated values is safe and
+    # avoids several guaranteed-failure OCR retries.
+    repeated_match = re.search(r'(\d{1,3})\s*/\s*(\d{1,3})', line_text)
+    if repeated_match and repeated_match.group(1) == repeated_match.group(2):
+        max_hp = int(repeated_match.group(2))
+        if 10 <= max_hp <= 500:
+            log.debug("HP read (bar-anchored pair): %d (text='%s', bar_y=%d)",
+                      max_hp, line_text, bar_y)
+            return max_hp
+
     # Step 2: Read HP text below the bar
     # Try Tesseract first (fast), then PaddleOCR if Tesseract fails or disagrees
     from collections import Counter
@@ -204,7 +424,7 @@ def read_hp(image: Image.Image, screen_width: int, screen_height: int) -> int:
 
     for offset in range(25, 55, 3):
         y_start = bar_y + offset
-        crop = image.crop((int(280 * sx), y_start, int(680 * sx), y_start + int(25 * sy)))
+        crop = image.crop((int(w * 0.25), y_start, int(w * 0.75), y_start + max(25, int(25 * sy))))
         crop_arr = np.array(crop)
         gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
         gray_5x = cv2.resize(gray, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
@@ -256,6 +476,7 @@ def read_hp(image: Image.Image, screen_width: int, screen_height: int) -> int:
     return -1
 
 
+@timing.timed("reader.hp_paddle")
 def _read_hp_paddle(arr: np.ndarray, bar_y: int, sx: float, sy: float) -> int:
     """Read HP using PaddleOCR on the text area below the HP bar.
 
@@ -325,6 +546,7 @@ def _read_hp_paddle(arr: np.ndarray, bar_y: int, sx: float, sy: float) -> int:
 SIZE_TAGS = {"LIGHTEST", "HEAVIEST", "SHORTEST", "TALLEST", "XXS", "XXL"}
 
 
+@timing.timed("reader.size_label")
 def read_size_label(image: Image.Image, region: BBox) -> str:
     """Read a weight/height label to detect size tags.
 

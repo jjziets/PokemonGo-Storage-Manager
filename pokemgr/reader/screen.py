@@ -1,14 +1,17 @@
 """ScreenReader facade — combines OCR, bar reading, and icon detection."""
 
 import logging
+import os
 import time
-from dataclasses import dataclass
+import weakref
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from ..calibration.profile import CalibrationProfile
+from .. import timing
 from ..config import (
     SCREEN_STABLE_THRESHOLD,
     SCREEN_STABLE_MAX_WAIT,
@@ -104,25 +107,200 @@ class PokemonRead:
 class ScreenReader:
     """Reads Pokemon data from phone screenshots using calibrated regions."""
 
-    def __init__(self, profile: CalibrationProfile):
+    def __init__(self, profile: CalibrationProfile, *, fast_cp: bool = False,
+                 read_size_tags: bool = True):
         self.regions = profile.regions
+        self._density = profile.density
         self._save_screenshots = True
+        self._fast_cp = fast_cp
+        self._read_size_tags = read_size_tags
+        self._native_enabled = os.environ.get("POKEMGR_NATIVE_OCR") == "1"
+        self._native_ocr = None
+
+    def prepare_native_ocr(self):
+        """Start and warm the native worker before measuring the scan."""
+        if not self._native_enabled or self._native_ocr is not None:
+            return
+        from .native_ocr import NativeOCR, NativeOCRError, NativeOCRFrameError
+        worker = NativeOCR()
+        try:
+            worker.start()
+            worker.recognize(Image.new("RGB", (64, 64), "white"), frame_id="warmup")
+        except NativeOCRFrameError as exc:
+            log.warning("Native OCR warmup text was unusable; awaiting the first real frame: %s", exc)
+            self._native_ocr = worker
+        except NativeOCRError as exc:
+            worker.close()
+            self._native_enabled = False
+            log.warning("Native OCR unavailable; using existing OCR: %s", exc)
+        else:
+            self._native_ocr = worker
+
+    @timing.timed("reader.native_frame")
+    def native_fields(self, image):
+        """Recognize all text once, cached only on this exact image object."""
+        if not self._native_enabled:
+            return None
+        key = "pokemgr_native_fields"
+        owner = image.info.get("pokemgr_native_owner")
+        if (key in image.info and isinstance(owner, tuple) and len(owner) == 3
+                and isinstance(owner[0], weakref.ReferenceType) and owner[0]() is self
+                and isinstance(owner[1], weakref.ReferenceType) and owner[1]() is image
+                and owner[2] == image.size):
+            return image.info[key]
+        # Pillow copies info when images are copied/cropped/resized. Evidence
+        # attached to the source object cannot authorize those new pixels.
+        image.info.pop(key, None)
+        image.info.pop("pokemgr_native_text", None)
+        image.info.pop("pokemgr_native_cp_text", None)
+        self.prepare_native_ocr()
+        if self._native_ocr is None:
+            return None
+        from .native_ocr import NativeOCRError, NativeOCRFrameError, parse_appraisal_fields
+        try:
+            result = self._native_ocr.recognize(image, frame_id=str(id(image)))
+            image.info["pokemgr_native_text"] = result
+            fields = parse_appraisal_fields(result, self.regions, density=self._density)
+        except NativeOCRFrameError as exc:
+            log.warning("Native OCR rejected this frame; using existing OCR for it: %s", exc)
+            fields = None
+        except (NativeOCRError, ValueError) as exc:
+            log.warning("Native OCR frame failed; using existing OCR: %s", exc)
+            self.close()
+            self._native_enabled = False
+            fields = None
+        image.info[key] = fields
+        # Integer object IDs can be recycled after the source image dies while
+        # a Pillow copy still carries its info. Weak references prove that the
+        # live source object itself owns this evidence without keeping it alive.
+        image.info["pokemgr_native_owner"] = (weakref.ref(self), weakref.ref(image), image.size)
+        return fields
+
+    def _native_cp_refinement(self, image, raw):
+        """One accurate, contextual CP crop; keep its evidence separate."""
+        key = "pokemgr_native_cp_text"
+        if key in image.info:
+            return image.info[key]
+        from ..calibration.regions import BBox
+        from .native_ocr import NativeFrameText, NativeOCRError
+        region = self.regions.cp_region
+        pad_x = max(1, round(20 * image.width / 968))
+        pad_y = max(1, round(20 * image.height / 2376))
+        x, y = max(0, region.x-pad_x), max(0, region.y-pad_y)
+        x2, y2 = min(image.width, region.x2+pad_x), min(image.height, region.y2+pad_y)
+        try:
+            result = self._native_ocr.recognize_region(
+                image, BBox(x, y, x2-x, y2-y), frame_id=raw.frame_id, mode="accurate",
+            )
+            if (not isinstance(result, NativeFrameText) or result.frame_id != raw.frame_id
+                    or (result.width, result.height) != image.size):
+                raise NativeOCRError("Native CP refinement belongs to a different frame")
+        except (NativeOCRError, ValueError) as exc:
+            log.warning("Native CP crop failed; retaining only the original frame text: %s", exc)
+            result = None
+        image.info[key] = result
+        return result
+
+    def native_cp(self, image, *, expected_cps=None):
+        """Return a same-frame native observation without expensive OCR fallback."""
+        fields = self.native_fields(image)
+        if fields is not None and fields.cp_conflict:
+            return -1, -1.0
+        raw = image.info.get("pokemgr_native_text")
+        if fields is not None and raw is not None and expected_cps is not None:
+            from .native_ocr import parse_appraisal_fields
+            refinement = image.info.get("pokemgr_native_cp_text")
+            observed = (replace(raw, observations=raw.observations + refinement.observations)
+                        if refinement is not None else raw)
+            fields = parse_appraisal_fields(
+                observed, self.regions, density=self._density, expected_cps=expected_cps,
+            )
+            if fields.cp <= 0 and not fields.cp_conflict and expected_cps and self._native_ocr is not None:
+                refinement = self._native_cp_refinement(image, raw)
+                if refinement is not None:
+                    fields = parse_appraisal_fields(
+                        replace(raw, observations=raw.observations + refinement.observations),
+                        self.regions, density=self._density, expected_cps=expected_cps,
+                    )
+        if fields is not None and fields.cp_conflict:
+            return -1, -1.0
+        if (fields is not None and fields.cp > 0
+                and (expected_cps is None or fields.cp in expected_cps)):
+            return fields.cp, fields.cp_confidence
+        return -1, 0.0
+
+    def close(self):
+        if self._native_ocr is not None:
+            self._native_ocr.close()
+            self._native_ocr = None
 
     def read_hp(self, image: Image.Image) -> int:
         """Read HP from the screen. Returns max HP or -1."""
+        native = self.native_fields(image)
+        if native is not None and native.hp > 0:
+            return native.hp
         w, h = self.regions.screen_width, self.regions.screen_height
         return ocr.read_hp(image, w, h)
 
+    def read_candy_family(self, image: Image.Image) -> tuple[str, float]:
+        """Read evolution-family evidence only when explicitly requested."""
+        native = self.native_fields(image)
+        if native is not None and native.candy_conflict:
+            return "", -1.0
+        if native is not None and native.candy_family:
+            return native.candy_family, native.candy_confidence
+        owner = image.info.get("pokemgr_candy_owner")
+        if (isinstance(owner, tuple) and len(owner) == 3
+                and isinstance(owner[0], weakref.ReferenceType) and owner[0]() is self
+                and isinstance(owner[1], weakref.ReferenceType) and owner[1]() is image
+                and owner[2] == image.size):
+            return image.info["pokemgr_candy_read"]
+        from .candy import read_candy_family
+        try:
+            result = read_candy_family(image)
+        except Exception as exc:
+            log.debug("Candy label fallback failed: %s", exc)
+            result = "", 0.0
+        image.info["pokemgr_candy_read"] = result
+        image.info["pokemgr_candy_owner"] = (weakref.ref(self), weakref.ref(image), image.size)
+        return result
+
+    def read_cp(self, image: Image.Image, *, expected_cps=None,
+                fast: bool = False) -> tuple[int, float]:
+        """Read CP, optionally constrained to exact recovery candidates."""
+        cp, confidence = self.native_cp(image, expected_cps=expected_cps)
+        if confidence < 0:
+            return -1, 0.0
+        if cp > 0:
+            return cp, confidence
+        native = self.native_fields(image)
+        if native is not None and native.cp_conflict:
+            return -1, 0.0
+        return ocr.read_cp(
+            image, self.regions.cp_region, expected_cps=expected_cps, fast=fast,
+        )
+
+    @timing.timed("reader.detail")
     def read_detail_screen(self, image: Image.Image,
-                           adb_controller=None) -> dict:
+                           adb_controller=None, *, include_cp: bool = True) -> dict:
         """Read species, CP, and icon states from the Pokemon detail screen.
 
-        Pass adb_controller to enable multi-capture shiny detection.
+        Pass adb_controller to enable multi-capture shiny detection. Appraisal
+        scanning can defer CP until HP and IVs establish whether it is needed.
         """
         r = self.regions
 
-        species, name_conf = ocr.read_species_name(image, r.name_region)
-        cp, cp_conf = ocr.read_cp(image, r.cp_region)
+        native = self.native_fields(image)
+        display_name, name_conf = (
+            (native.display_name, native.name_confidence)
+            if native is not None and native.display_name
+            else ocr.read_species_name(image, r.name_region)
+        )
+        species = match_species_name(display_name)
+        cp, cp_conf = (
+            self.read_cp(image, fast=self._fast_cp)
+            if include_cp else (-1, 0.0)
+        )
 
         # Shiny detection disabled — use search filter passes instead
         # (visual sparkle detection is unreliable on appraisal screen)
@@ -130,11 +308,19 @@ class ScreenReader:
         # Shadow detection disabled — use search filter passes instead
         # (visual detection has false positives on dark-themed Pokemon like Ghost types)
         shadow = False
-        favorited = icons.is_favorited(image, r.favorite_star_region)
-        lucky = icons.is_lucky(image, r.lucky_icon_region)
-        gender = _detect_gender(image, r.gender_region)
-        weight_tag = ocr.read_size_label(image, r.weight_label_region)
-        height_tag = ocr.read_size_label(image, r.height_label_region)
+        with timing.span("reader.icons"):
+            favorited = icons.is_favorited(image, r.favorite_star_region)
+            lucky = (native.lucky if native is not None and native.lucky is not None
+                     else icons.is_lucky(image, r.lucky_icon_region))
+            gender = _detect_gender(image, r.gender_region)
+        weight_tag = (
+            ocr.read_size_label(image, r.weight_label_region)
+            if self._read_size_tags else ""
+        )
+        height_tag = (
+            ocr.read_size_label(image, r.height_label_region)
+            if self._read_size_tags else ""
+        )
 
         # Dynamax detection disabled — use search filter passes instead
         # (visual purple icon detection has false positives)
@@ -142,6 +328,11 @@ class ScreenReader:
 
         return {
             "species": species,
+            "display_name": display_name,
+            "name_corrected": species.casefold() != display_name.casefold(),
+            "candy_family": native.candy_family if native is not None else "",
+            "candy_confidence": native.candy_confidence if native is not None else 0.,
+            "candy_conflict": native.candy_conflict if native is not None else False,
             "cp": cp,
             "shiny": shiny,
             "shadow": shadow,
@@ -151,9 +342,10 @@ class ScreenReader:
             "weight_tag": weight_tag,
             "height_tag": height_tag,
             "is_dynamax": is_dynamax,
-            "confidence": (name_conf + cp_conf) / 2,
+            "confidence": (name_conf + cp_conf) / 2 if include_cp else name_conf,
         }
 
+    @timing.timed("reader.iv")
     def read_appraisal_screen(self, image: Image.Image) -> dict:
         """Read ATK/DEF/STA IV values from the appraisal overlay.
 
@@ -211,6 +403,7 @@ class ScreenReader:
             screenshot_path=screenshot_path,
         )
 
+    @timing.timed("screen.bars_visible")
     def are_bars_visible(self, image: Image.Image) -> bool:
         """Check if IV bars are visible using dynamic bar finding."""
         return bars.are_bars_present(image)

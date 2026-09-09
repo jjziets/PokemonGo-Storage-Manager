@@ -1,3 +1,4 @@
+# TRACEWEAVER: file-role=runtime-cp-policy; req=REQ-SCAN-002; trace=TRACE-SCAN-002; ver=VER-SCAN-001
 """Global configuration, constants, and utilities."""
 
 import os
@@ -35,6 +36,7 @@ SWIPE_DURATION_JITTER_MS = 30    # minimal variation
 DELAY_AFTER_APPRAISE_TAP = (0.0, 0.0)   # only used when first opening appraisal
 DELAY_AFTER_CLOSE_APPRAISAL = (0.05, 0.05)
 DELAY_AFTER_SWIPE = (0.0, 0.0)          # zero — screencap itself takes ~0.9s which is enough
+STABLE_FRAME_INTERVAL = (0.15, 0.10)   # Capture-start minimum plus random jitter; transport counts.
 
 # Anti-detection (optional — can disable via GUI)
 ANTI_DETECTION_ENABLED = True
@@ -45,8 +47,22 @@ MICRO_BREAK_DURATION = (1.0, 3.0)   # 1-3 second pause
 BAR_WAIT_MAX = 0.0  # max seconds to wait for bars to appear
 
 # CP mode
-USE_CALCULATED_CP = False  # If True, derive CP from IVs+HP+Species instead of OCR
-CAPTURE_SIZE_TAGS = False  # If True, close appraisal briefly to read size labels (~2s slower)
+# Use species/form + HP + IV evidence first when it leaves one exact CP.
+# Ambiguous results use visible CP, then optional animation recovery.
+USE_CALCULATED_CP = True
+USE_CP_ANIMATION_RECOVERY = True
+CAPTURE_SIZE_TAGS = False  # Read visible size labels with extra OCR when enabled.
+
+
+# TRACEWEAVER: entrypoint=calculated_cp_recovery_enabled; req=REQ-SCAN-002; trace=TRACE-SCAN-002; ver=VER-SCAN-001
+def calculated_cp_recovery_enabled() -> bool:
+    """Return the current exact-CP recovery policy for a new scan worker."""
+    return bool(USE_CALCULATED_CP)
+
+
+def cp_animation_recovery_enabled() -> bool:
+    """Return whether a new scan may use model gestures and CP previews."""
+    return bool(USE_CP_ANIMATION_RECOVERY)
 
 # ── Battery ──────────────────────────────────────────────────────────
 MIN_BATTERY_LEVEL = 20

@@ -67,8 +67,8 @@ No modification to Pokemon Go is involved. The tool interacts with the phone exa
    - **IV bars** — Pixel analysis of the ATK/DEF/STA bar fill levels (0–15 each)
    - **HP** — OCR from the HP text
    - **Icons** — Pixel detection for favorite star, lucky background, gender
-4. **Fingerprint validation** — IVs + HP uniquely identify the Pokemon's species and level via the CP formula. If the calculated CP matches OCR CP, the read is confirmed. If not, the tool retries with animation tricks to get an unobstructed CP read.
-5. All data is stored in **SQLite** with automatic deduplication
+4. **Exact validation** — Complete species/form, HP and IV evidence is checked against the CP formula. A uniquely calculated CP is independently confirmed. Ambiguous cases use CP OCR, then optional bounded rotation/tap and canceled-preview recovery. Candy text constrains the evolution family; it does not replace the caught species with the base Pokemon.
+5. **SQLite** stores one row per verified scan-session position. Same-stat adjacent Pokemon stay separate; a new scan session is not automatically merged with previous sessions.
 
 ### Decision Engine
 
@@ -77,6 +77,8 @@ The decision engine applies rules per species group (in priority order):
 | Rule | What it keeps |
 |------|--------------|
 | `BEST_OVERALL` | Highest IV total, then highest CP |
+| `KEEP_PERFECT_IV` | Every exact 15/15/15 specimen, including duplicates; enabled by default |
+| `BEST_CP` | Highest current CP per stored species/form, alongside other keepers; enabled by default |
 | `BEST_SHINY` | Best shiny specimen per species |
 | `BEST_SHADOW` | Best shadow specimen per species |
 | `BEST_DYNAMAX` | Best Dynamax/Gigantamax per species |
@@ -86,34 +88,42 @@ The decision engine applies rules per species group (in priority order):
 | `BEST_LIGHTEST` / `HEAVIEST` / `SHORTEST` / `TALLEST` | Size record holders |
 | Safety | Never transfer the last of any species |
 
-Everything else is marked `TRANSFER`.
+Everything else is marked `TRANSFER` as a suggestion for review. PvP uses exact
+stored forms and excludes specimens already above the league CP cap. Its cached
+IV rankings still need rebuilding/versioning after calculation changes, and
+evolution potential, moves, teams and broader collection preferences are not
+evaluated. Existing favorite stars are not automatic KEEP rules, and rerunning
+the engine replaces manual decisions. Do not interpret the list as proof that
+every suggested transfer is unnecessary.
 
 ### Execution
 
 After reviewing decisions in the GUI, the executor:
-1. Searches `!favorite&!shiny` (and other pass filters) in-game
-2. Swipes through each Pokemon's appraisal screen
-3. Matches species + IVs + HP against the keeper list
-4. Taps the favorite star on matches
-5. Once all keepers are favorited, you mass-transfer everything unfavorited in Pokemon Go — the game blocks transfer of favorited Pokemon as a safety net
+1. Verifies the complete in-game search filter before opening its results.
+2. Reads stable appraisal evidence through the shared scanner.
+3. Matches exact species/form, CP, HP, IVs and category flags against keeper occurrences.
+4. Checks identity and the observed star, toggles once when needed, and verifies the result.
+5. Reports unmatched, ambiguous, stopped and failed results for review. It never transfers Pokemon.
 
 ## Features
 
 - **Multi-pass scanning** with configurable search filters (Normal, Shiny, Shadow, Lucky, Dynamax, Gigantamax, Custom)
-- **Dual OCR** — Tesseract for speed, PaddleOCR as accurate fallback
+- **Shared frame OCR** — native macOS Vision on the app stream, with Tesseract and optional PaddleOCR paths
+- **App-only stream** — a local scrcpy client exports a bounded 30-frame buffer; UI controls turn the physical phone screen on or off
+- **Process monitoring** — CPU and RSS for the manager and verified helpers; GPU usage is labeled unavailable when it cannot be measured
 - **Fingerprint validation** — Every Pokemon verified against the CP formula before storing
 - **PvP IV rankings** — Computed from PvPoke gamemaster.json for all leagues
 - **Desktop GUI** (PySide6/Qt) with dark theme, live scan progress, collection browser with sorting/filtering, decision review with drag-and-drop
 - **Resume support** — Fast-swipe past already-scanned Pokemon with target verification
 - **Anti-detection** — Randomized delays, tap jitter, configurable micro-breaks
-- **Safety first** — Unreadable Pokemon are favorited for protection, never transferred
+- **Unresolved captures** — verified favorite-for-review fallback; lost identity stops instead of toggling blindly
 - **Battery monitoring** — Auto-pause when battery drops below 20%
 - **CSV export** for spreadsheet review
 - **Dry run mode** — Test the favorite pass without actually tapping stars
 
 ## Requirements
 
-- **Python 3.10+** (developed on 3.13)
+- **Python 3.11+** (tested on 3.13)
 - **Android phone** connected via USB with ADB debugging enabled
 - **Pokemon Go** installed on the phone
 - **Tesseract OCR** installed on the host machine
@@ -152,6 +162,15 @@ pip install paddleocr paddlepaddle
 python run.py gui
 ```
 
+For the macOS app stream and dark-phone controls, use:
+
+```bash
+scripts/macos_launcher.zsh
+```
+
+See the [phone scan runbook](docs/runbooks/phone-scan.md) for scrcpy, native
+helper build prerequisites, calibration, supported Android setup, and recovery.
+
 1. Click **Connect** to establish ADB connection
 2. Configure scan passes (Normal, Shiny, Shadow, etc.)
 3. Adjust speed settings if needed
@@ -160,7 +179,7 @@ python run.py gui
 6. After scanning, go to the **Decisions** tab and click **Run Decision Engine**
 7. Review KEEP/TRANSFER lists, adjust as needed
 8. Click **Fav Keepers (Dry)** to test, then **Fav Keepers (REAL)** to execute
-9. In Pokemon Go, mass-transfer all unfavorited Pokemon
+9. Review unresolved matches and keeper suggestions before making any manual transfer decisions in Pokemon Go
 
 ### CLI
 
@@ -237,26 +256,35 @@ The calibration system automatically creates device-specific profiles based on m
 
 ## Performance
 
-Typical scan rates on Galaxy Z Fold6 (USB connection):
+A bounded 10-Pokemon M4 Pro/Fold6 stream sample completed in 22.565 seconds
+(about 26.6/min including startup). Obscured CP recovery can take much longer;
+this is not a whole-storage throughput guarantee. Optional timing spans report
+capture, OCR, validation and navigation costs; see the runbook.
 
-| Mode | Speed | Notes |
-|------|-------|-------|
-| Normal scan | ~30-40/min | Full validation with fingerprinting |
-| Fast (Calc CP) | ~45-50/min | Skips CP OCR, uses calculated CP |
-| Skip/Resume | ~600/min | Fast-swiping past already scanned |
+## Tests
 
-A full 3,000 Pokemon storage scan takes approximately 1.5–2 hours.
+```bash
+pip install -r requirements-dev.txt
+QT_QPA_PLATFORM=offscreen python -m pytest -q tests
+python scripts/scrcpy_frame_sink/test_native.py
+```
+
+The pytest command includes both unittest classes and standalone pytest tests.
+Private live-capture regressions skip when their local files are absent. To run
+optional JPEG/profile regressions, set `POKEMGR_TEST_PROFILE` to your local
+calibration JSON. Native frame-buffer tests require the project-local build;
+the C bridge command also requires the documented macOS native dependencies.
 
 ## Safety
 
 The tool is designed with multiple safety layers:
 
 1. **Fingerprint validation** — Every Pokemon's stats are verified against the CP formula before storing
-2. **Unreadable = protected** — If the tool can't confidently read a Pokemon, it favorites it rather than risk incorrect data
+2. **Verified recovery** — Unresolved CP can trigger favorite-for-review only while identity and the star state remain verifiable; lost identity stops the operation
 3. **Review before execute** — The decision engine output is always reviewed in the GUI before any favorites are applied
 4. **Dry run mode** — Test the favorite pass without actually tapping stars
-5. **Favorite-first strategy** — Keepers are favorited before any transfer happens; Pokemon Go blocks transfer of favorited Pokemon
-6. **Never auto-transfer** — The tool only favorites keepers. Mass-transfer is always done manually by the user in Pokemon Go
+5. **Visible action results** — Unmatched, ambiguous and interrupted favorite actions remain visible for review
+6. **Never auto-transfer** — The tool offers favorite/unfavorite actions; transfer decisions and any transfers remain with the user
 
 ## License
 

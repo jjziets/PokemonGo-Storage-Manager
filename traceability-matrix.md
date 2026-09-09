@@ -1,0 +1,23 @@
+# Traceability — stream scanning and keeper decisions
+
+Baseline: `REQ-BASELINE-2026-09-09-001`; semantic SHA256 `4b966981a29f704128139ccb4c85dfd6dcdbd456e08911d06a2b4379c2fb929a`. Authority is the current stakeholder conversation as recorded in `requirements.md`; August records are historical. Publication includes accumulated scanner, native stream, action and decision work, with the limits below.
+
+## Traceability Matrix
+
+| Trace ID | Requirement | Implementation | Verification | Validation |
+| --- | --- | --- | --- | --- |
+| TRACE-SCAN-001 | REQ-SCAN-001 | `pokemgr/indexer/snapshot.py`, `pokemgr/pvp/resolver.py`, `pokemgr/pvp/calculator.py`, `pokemgr/pvp/cpm_table.py` | `tests/test_snapshot_policy.py`, `tests/test_snapshot_resolver.py`, `tests/test_cpm_precision.py` | Exact hidden/visible CP examples in publication evidence |
+| TRACE-SCAN-002 | REQ-SCAN-002 | `pokemgr/indexer/state_machine.py`, `pokemgr/config.py`, `pokemgr/gui/widgets/scan_control.py`, `pokemgr/reader/powerup.py` | `tests/test_hp_iv_first.py`, `tests/test_cp_model_recovery.py`, `tests/test_powerup_recovery.py`, `tests/test_settled_pair_reuse.py` | Bounded Zygarde/Dragonite recovery |
+| TRACE-SCAN-003 | REQ-SCAN-003 | `pokemgr/indexer/state_machine.py`, `pokemgr/indexer/multi_pass.py`, `pokemgr/adb/navigator.py` | `tests/test_transition_retry.py`, `tests/test_stable_scan_loop.py`, `tests/test_navigator_recovery.py`, `tests/test_scan_recovery.py` | Same-stat Lunatone sequence |
+| TRACE-SCAN-004 | REQ-SCAN-004 | `pokemgr/indexer/state_machine.py`, `pokemgr/execution/executor.py`, `pokemgr/reader/icons.py` | `tests/test_favorite_unresolved.py`, `tests/test_favorite_state.py`, `tests/test_mass_action_scanning.py` | Verified one-toggle readback, zero mutation during publication |
+| TRACE-STREAM-001 | REQ-STREAM-001 | `pokemgr/adb/controller.py`, `pokemgr/adb/frame_buffer.py`, `pokemgr/adb/clock_sync.py`, `pokemgr/adb/stream_capture.py`, `pokemgr/reader/native_ocr.py`, `pokemgr/reader/screen.py`, `pokemgr/reader/ocr.py`, `scripts/stream_pokemon.py`, `scripts/scrcpy_frame_sink/`, `scripts/android_clock/`, `scripts/native_ocr.swift`, `pokemgr/gui/resource_monitor.py`, `pokemgr/timing.py` | Stream/native/clock/resource/timing tests under `tests/`; `scripts/scrcpy_frame_sink/test_native.py` | Bounded M4Pro/Fold6 live sample, dark physical display |
+| TRACE-MASS-001 | REQ-MASS-001 | `pokemgr/execution/executor.py`, `pokemgr/gui/`, `pokemgr/adb/search_text.py`, `scripts/android_search/`, `run.py` | `tests/test_search_text.py`, `tests/test_mass_action_scanning.py`, `tests/test_mass_action_gui.py`, `tests/test_decision_action_routing.py`, `tests/test_action_worker_cleanup.py` | Exact full query readback and read-only keeper sample |
+| TRACE-IDENTITY-001 | REQ-IDENTITY-001 | `pokemgr/reader/candy.py`, `pokemgr/reader/name_matcher.py`, `pokemgr/pvp/gamemaster.py`, `pokemgr/pvp/fingerprint.py`, `pokemgr/pvp/resolver.py` | `tests/test_candy_family.py`, `tests/test_native_reader_integration.py` | Exeggcute candy constrains Exeggutor without replacing species |
+| TRACE-DECISION-001 | REQ-DECISION-001 | `pokemgr/decision/engine.py`, `pokemgr/decision/rules.py`, `pokemgr/gui/widgets/decision_review.py` | `tests/test_decision_identity.py`, `tests/test_decision_highest_cp.py`, `tests/test_decision_perfect_ivs.py`, `tests/test_decision_action_widget.py` | Read-only Garchomp/highestCP and duplicate-perfect Mewtwo examples |
+| TRACE-DATA-001 | REQ-DATA-001 | `pokemgr/data/database.py`, `pokemgr/calibration/`, `pokemgr/gui/workers.py`, `scripts/macos_launcher.zsh` | `tests/test_database_positions.py`, `tests/test_calibration_workflow.py`, `tests/test_stream_resource_cleanup.py`, `tests/test_stream_launcher.py` | User data retained, cooperative cleanup |
+
+## Evidence and held claims
+
+Current verification, review identities and local command results are summarized in `docs/reviews/2026-09-09-publication.md`. Tests linked above are representative entry points; publication runs the complete discovered suite. Native and private-image checks can be unavailable on a fresh checkout and are reported separately from reproducible checks. Historical inline VER-SCAN-001 anchors refer to the original test work and do not imply blanket acceptance of later features.
+
+This is an advisory project baseline recording already-authorized work. No test-first history, complete transfer advice, full-storage throughput, GPU measurement, universal device compatibility or deployment is claimed. Known decision/PvP model debt is explicitly retained in `requirements.md` and the README. Publication authorization is independent of future phone mutations or database changes.

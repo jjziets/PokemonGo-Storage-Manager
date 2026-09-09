@@ -1,3 +1,4 @@
+# TRACEWEAVER: file-role=scan-control-cp-policy; req=REQ-SCAN-002; trace=TRACE-SCAN-002; ver=VER-SCAN-001
 """Scan control panel — start/stop scanning with live progress."""
 
 from PySide6.QtWidgets import (
@@ -17,6 +18,7 @@ class ScanControl(QWidget):
         super().__init__(parent)
         self._setup_ui()
 
+# TRACEWEAVER: entrypoint=_setup_ui; req=REQ-SCAN-002; trace=TRACE-SCAN-002; ver=VER-SCAN-001
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -29,6 +31,18 @@ class ScanControl(QWidget):
         conn_layout.addWidget(self.device_label)
         self.connect_btn = QPushButton("Connect")
         conn_layout.addWidget(self.connect_btn)
+        self.phone_screen_on_btn = QPushButton("Turn phone screen on")
+        self.phone_screen_on_btn.setEnabled(False)
+        self.phone_screen_on_btn.setToolTip(
+            "Turn on the physical phone display while keeping the app stream connected"
+        )
+        conn_layout.addWidget(self.phone_screen_on_btn)
+        self.phone_screen_off_btn = QPushButton("Turn phone screen off")
+        self.phone_screen_off_btn.setEnabled(False)
+        self.phone_screen_off_btn.setToolTip(
+            "Turn off the physical phone display while the app-only stream keeps running"
+        )
+        conn_layout.addWidget(self.phone_screen_off_btn)
 
         self.clear_db_btn = QPushButton("Clear Database")
         self.clear_db_btn.setStyleSheet("QPushButton { background-color: #5a3a3a; }")
@@ -90,46 +104,33 @@ class ScanControl(QWidget):
 
         # ── Speed settings ──
         speed_group = QGroupBox("Speed Tuning")
-        speed_layout = QHBoxLayout(speed_group)
+        speed_rows = QVBoxLayout(speed_group)
+        speed_layout = QHBoxLayout()
 
-        speed_layout.addWidget(QLabel("Appraise delay:"))
-        self.appraise_delay_spin = QDoubleSpinBox()
-        self.appraise_delay_spin.setRange(0.1, 3.0)
-        self.appraise_delay_spin.setValue(0.5)
-        self.appraise_delay_spin.setSingleStep(0.1)
-        self.appraise_delay_spin.setSuffix("s")
-        self.appraise_delay_spin.setToolTip("Wait after opening appraisal (lower = faster, may miss bars)")
-        speed_layout.addWidget(self.appraise_delay_spin)
+        speed_layout.addWidget(QLabel("Frame interval:"))
+        self.frame_interval_spin = QDoubleSpinBox()
+        self.frame_interval_spin.setRange(0.15, 1.0)
+        self.frame_interval_spin.setValue(0.15)
+        self.frame_interval_spin.setSingleStep(0.05)
+        self.frame_interval_spin.setSuffix(" s")
+        self.frame_interval_spin.setToolTip(
+            "Time between frame captures, plus random 0–0.10 s jitter. "
+            "Capture time counts toward this interval. Two stable frames are still required."
+        )
+        speed_layout.addWidget(self.frame_interval_spin)
 
-        speed_layout.addWidget(QLabel("Swipe delay:"))
-        self.swipe_delay_spin = QDoubleSpinBox()
-        self.swipe_delay_spin.setRange(0.0, 1.0)
-        self.swipe_delay_spin.setValue(0.0)
-        self.swipe_delay_spin.setSingleStep(0.05)
-        self.swipe_delay_spin.setSuffix("s")
-        self.swipe_delay_spin.setToolTip("Wait after swipe before reading (lower = faster)")
-        speed_layout.addWidget(self.swipe_delay_spin)
+        self.swipe_duration_label = QLabel("Swipe: calibrated")
+        self.swipe_duration_label.setToolTip(
+            "Swipe duration comes from the connected display's calibration."
+        )
+        speed_layout.addWidget(self.swipe_duration_label)
 
-        speed_layout.addWidget(QLabel("Bar wait:"))
-        self.bar_wait_spin = QDoubleSpinBox()
-        self.bar_wait_spin.setRange(0.1, 3.0)
-        self.bar_wait_spin.setValue(1.5)
-        self.bar_wait_spin.setSingleStep(0.1)
-        self.bar_wait_spin.setSuffix("s")
-        self.bar_wait_spin.setToolTip("Max time to wait for appraisal bars to appear (lower = faster, may miss)")
-        speed_layout.addWidget(self.bar_wait_spin)
-
-        speed_layout.addWidget(QLabel("Swipe ms:"))
-        self.swipe_duration_spin = QSpinBox()
-        self.swipe_duration_spin.setRange(50, 500)
-        self.swipe_duration_spin.setValue(120)
-        self.swipe_duration_spin.setSingleStep(10)
-        self.swipe_duration_spin.setToolTip("Swipe gesture duration in milliseconds (lower = faster flick)")
-        speed_layout.addWidget(self.swipe_duration_spin)
-
-        self.calc_cp_check = QCheckBox("Calc CP")
-        self.calc_cp_check.setChecked(False)
-        self.calc_cp_check.setToolTip("Use calculated CP from IVs+HP+Species instead of OCR (faster, avoids CP read issues)")
+        self.calc_cp_check = QCheckBox("Exact CP recovery")
+        self.calc_cp_check.setChecked(True)
+        self.calc_cp_check.setToolTip(
+            "Calculate CP first when species/form + HP + IVs produce one exact "
+            "value, confirmed on a second appraisal read. Otherwise read visible CP."
+        )
         speed_layout.addWidget(self.calc_cp_check)
 
         self.anti_detection_check = QCheckBox("Anti-detect")
@@ -141,7 +142,7 @@ class ScanControl(QWidget):
         self.size_tags_check.setChecked(False)
         self.size_tags_check.setToolTip(
             "Capture LIGHTEST/HEAVIEST/SHORTEST/TALLEST tags.\n"
-            "Closes appraisal briefly per Pokemon (~2s slower each).\n"
+            "Reads visible size labels using extra OCR.\n"
             "Off by default for speed."
         )
         speed_layout.addWidget(self.size_tags_check)
@@ -157,6 +158,14 @@ class ScanControl(QWidget):
         speed_layout.addWidget(self.reset_speed_btn)
 
         speed_layout.addStretch()
+        speed_rows.addLayout(speed_layout)
+        self.cp_animation_check = QCheckBox("Try taps and previews for unresolved CP (slower)")
+        self.cp_animation_check.setChecked(True)
+        self.cp_animation_check.setToolTip(
+            "Try model taps, rotations, and a cancelled power-up preview only when HP + IVs "
+            "do not produce one exact CP. Pokemon still unresolved are favorited and skipped."
+        )
+        speed_rows.addWidget(self.cp_animation_check)
         layout.addWidget(speed_group)
 
         # Load saved settings
@@ -293,6 +302,7 @@ class ScanControl(QWidget):
         self.abort_btn.setEnabled(active)
         self.max_pokemon_spin.setEnabled(not active)
         self.unfavorite_check.setEnabled(not active)
+        self.cp_animation_check.setEnabled(not active)
 
     @Slot(int)
     def on_pass_count(self, expected: int):
@@ -419,29 +429,40 @@ class ScanControl(QWidget):
 
     # ── Speed settings persistence ─────────────────────────────────
 
+    def set_swipe_duration(self, duration):
+        """Show the connected calibration, without presenting a speed override."""
+        self.swipe_duration_label.setText(
+            f"Swipe: {duration} ms (calibrated)"
+            if type(duration) is int and duration > 0 else "Swipe: calibrated"
+        )
+
     SPEED_DEFAULTS = {
-        "appraise_delay": 0.5,
-        "swipe_delay": 0.0,
-        "bar_wait": 1.5,
-        "swipe_ms": 120,
+        "frame_interval": 0.15,
         "anti_detection": True,
-        "calc_cp": False,
+        "calc_cp": True,
+        "cp_animation": True,
         "size_tags": False,
     }
 
     def _save_speed_settings(self):
         import json
         from ...config import DATA_DIR
-        settings = {
-            "appraise_delay": self.appraise_delay_spin.value(),
-            "swipe_delay": self.swipe_delay_spin.value(),
-            "bar_wait": self.bar_wait_spin.value(),
-            "swipe_ms": self.swipe_duration_spin.value(),
+        path = DATA_DIR / "speed_settings.json"
+        try:
+            settings = json.loads(path.read_text())
+            if not isinstance(settings, dict):
+                settings = {}
+        except (OSError, ValueError):
+            settings = {}
+        for obsolete in ("appraise_delay", "swipe_delay", "bar_wait", "swipe_ms"):
+            settings.pop(obsolete, None)
+        settings.update({
+            "frame_interval": self.frame_interval_spin.value(),
             "anti_detection": self.anti_detection_check.isChecked(),
             "calc_cp": self.calc_cp_check.isChecked(),
+            "cp_animation": self.cp_animation_check.isChecked(),
             "size_tags": self.size_tags_check.isChecked(),
-        }
-        path = DATA_DIR / "speed_settings.json"
+        })
         path.write_text(json.dumps(settings, indent=2))
 
     def _load_speed_settings(self):
@@ -451,23 +472,19 @@ class ScanControl(QWidget):
         try:
             if path.exists():
                 settings = json.loads(path.read_text())
-                self.appraise_delay_spin.setValue(settings.get("appraise_delay", self.SPEED_DEFAULTS["appraise_delay"]))
-                self.swipe_delay_spin.setValue(settings.get("swipe_delay", self.SPEED_DEFAULTS["swipe_delay"]))
-                self.bar_wait_spin.setValue(settings.get("bar_wait", self.SPEED_DEFAULTS["bar_wait"]))
-                self.swipe_duration_spin.setValue(settings.get("swipe_ms", self.SPEED_DEFAULTS["swipe_ms"]))
+                self.frame_interval_spin.setValue(settings.get("frame_interval", self.SPEED_DEFAULTS["frame_interval"]))
                 self.anti_detection_check.setChecked(settings.get("anti_detection", self.SPEED_DEFAULTS["anti_detection"]))
                 self.calc_cp_check.setChecked(settings.get("calc_cp", self.SPEED_DEFAULTS["calc_cp"]))
+                self.cp_animation_check.setChecked(settings.get("cp_animation", self.SPEED_DEFAULTS["cp_animation"]))
                 self.size_tags_check.setChecked(settings.get("size_tags", self.SPEED_DEFAULTS["size_tags"]))
         except Exception:
             pass
 
     def _reset_speed_settings(self):
-        self.appraise_delay_spin.setValue(self.SPEED_DEFAULTS["appraise_delay"])
-        self.swipe_delay_spin.setValue(self.SPEED_DEFAULTS["swipe_delay"])
-        self.bar_wait_spin.setValue(self.SPEED_DEFAULTS["bar_wait"])
-        self.swipe_duration_spin.setValue(self.SPEED_DEFAULTS["swipe_ms"])
+        self.frame_interval_spin.setValue(self.SPEED_DEFAULTS["frame_interval"])
         self.anti_detection_check.setChecked(self.SPEED_DEFAULTS["anti_detection"])
         self.calc_cp_check.setChecked(self.SPEED_DEFAULTS["calc_cp"])
+        self.cp_animation_check.setChecked(self.SPEED_DEFAULTS["cp_animation"])
         self.size_tags_check.setChecked(self.SPEED_DEFAULTS["size_tags"])
         # Delete saved file
         from ...config import DATA_DIR
