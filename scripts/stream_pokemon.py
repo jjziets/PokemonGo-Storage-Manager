@@ -1,3 +1,5 @@
+# TRACEWEAVER: file-role=inventory-queue-stream-launch; req=REQ-SCAN-003,REQ-STREAM-001; trace=TRACE-SCAN-003,TRACE-STREAM-001; ver=VER-SCAN-001,VER-STREAM-ACTIVITY-001
+# TRACEWEAVER: entrypoint=manager_command; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 """Launch an isolated Pokemon GO stream and a manager bound to that display.
 
 Run with the project's Python after closing the existing manager and stream.
@@ -26,6 +28,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from pokemgr.adb.controller import ADBController  # noqa: E402
+from pokemgr.config import (  # noqa: E402
+    STANDARD_STREAM_WIDTH, STANDARD_STREAM_HEIGHT, STANDARD_STREAM_DENSITY,
+)
 from run import add_scan_start_arguments, validate_scan_start_arguments  # noqa: E402
 
 
@@ -33,7 +38,17 @@ SESSION_ENVIRONMENT = (
     'POKEMGR_DISPLAY_ID', 'POKEMGR_CAPTURE_DISPLAY_ID', 'POKEMGR_DEVICE_SERIAL',
     'POKEMGR_CAPTURE_FORMAT', 'POKEMGR_FRAME_BUFFER', 'POKEMGR_FRAME_SESSION',
     'POKEMGR_STREAM_PID', 'POKEMGR_FRAME_READER', 'POKEMGR_NATIVE_OCR',
+    'POKEMGR_EXPECTED_DISPLAY_GEOMETRY',
 )
+
+
+def display_geometry(info, *, native=False) -> str:
+    """Request one phone-shaped canvas unless native layout is explicit."""
+    width, height, density = ((info.width, info.height, info.density) if native else
+                             (STANDARD_STREAM_WIDTH, STANDARD_STREAM_HEIGHT, STANDARD_STREAM_DENSITY))
+    if any(type(value) is not int or value <= 0 for value in (width, height, density)):
+        raise ValueError('App display width, height and density must be positive integers')
+    return f'{width}x{height}/{density}'
 
 
 def _digest(path: Path) -> str:
@@ -47,8 +62,7 @@ def _prepare_stream_tools() -> tuple[Path, Path]:
     binary = directory / 'app/scrcpy'
     reader = directory / 'libpk_frame_reader.dylib'
     manifest_path = directory / 'pokemgr-build.json'
-    inputs = ('pokemgr_frame_sink.c', 'pokemgr_frame_sink.h', 'frame_reader.c',
-              'scrcpy-v4.1.patch', 'build.py')
+    inputs = build.INPUTS
 
     def current():
         try:
@@ -142,11 +156,28 @@ def stop(process: subprocess.Popen | None) -> None:
         process.wait(timeout=5)
 
 
+def manager_command(args) -> list[str]:
+    """Forward explicit scan intent to the GUI bound to this stream."""
+    command = [sys.executable, str(ROOT / 'run.py'), 'gui']
+    if getattr(args, 'scan_queue', None) is not None:
+        command.extend(['--scan-queue', args.scan_queue])
+    if args.start_scan:
+        command.append('--start-scan')
+        for attribute, option in (('skip_first', '--skip-first'),
+                                  ('resume_species', '--resume-species'), ('resume_cp', '--resume-cp')):
+            value = getattr(args, attribute)
+            if value is not None:
+                command.extend([option, str(value)])
+    return command
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--serial', help='ADB serial; defaults to the sole device')
     parser.add_argument('--capture-backend', choices=('stream', 'jpeg'), default='stream',
                         help='stream uses the paired frame window and native OCR; jpeg selects legacy capture')
+    parser.add_argument('--native-display', action='store_true',
+                        help='use device dimensions/DPI instead of the shared 968x2376/420 app layout')
     add_scan_start_arguments(parser)
     args = parser.parse_args()
     validate_scan_start_arguments(parser, args)
@@ -181,13 +212,17 @@ def main() -> int:
             parser.error('Connect one phone, or select it with --serial')
         adb.connect(devices[0])
     info = adb.get_device_info()
+    geometry = display_geometry(info, native=args.native_display)
     before = capture_displays(adb.shell('dumpsys SurfaceFlinger --display-id'))
     if before:
         parser.error('Close the existing scrcpy stream for this phone first')
 
     command = [
         scrcpy, f'--serial={adb.serial}', '--no-audio', '--max-fps=30',
-        f'--new-display={info.width}x{info.height}/{info.density}',
+        # Smooth small delivery gaps in the preview. The RGB exporter is a
+        # separate decoder sink, so scanner frames bypass this display buffer.
+        '--video-buffer=50',
+        f'--new-display={geometry}', '--no-downsize-on-error',
         '--no-vd-system-decorations', '--no-vd-destroy-content',
         '--display-ime-policy=local', '--start-app=com.nianticlabs.pokemongo',
         '--turn-screen-off', '--stay-awake', '--keep-active',
@@ -272,24 +307,16 @@ def main() -> int:
         environment['POKEMGR_CAPTURE_DISPLAY_ID'] = capture_id
         environment['POKEMGR_DEVICE_SERIAL'] = adb.serial
         environment['POKEMGR_CAPTURE_FORMAT'] = 'jpeg'
+        environment['POKEMGR_EXPECTED_DISPLAY_GEOMETRY'] = geometry
         if args.capture_backend == 'stream':
             environment.update(
                 POKEMGR_FRAME_BUFFER=frame_path, POKEMGR_FRAME_SESSION=frame_session,
                 POKEMGR_STREAM_PID=str(stream.pid), POKEMGR_FRAME_READER=str(reader_library),
                 POKEMGR_NATIVE_OCR='1',
             )
-        print(f'Starting manager on app display {display_id}', flush=True)
-        manager_command = [sys.executable, str(ROOT / 'run.py'), 'gui']
-        if args.start_scan:
-            manager_command.append('--start-scan')
-            if args.skip_first is not None:
-                manager_command.extend(['--skip-first', str(args.skip_first)])
-            if args.resume_species is not None:
-                manager_command.extend(['--resume-species', args.resume_species])
-            if args.resume_cp is not None:
-                manager_command.extend(['--resume-cp', str(args.resume_cp)])
+        print(f'Starting manager on app display {display_id} ({geometry})', flush=True)
         manager = subprocess.Popen(
-            manager_command,
+            manager_command(args),
             env=environment, cwd=ROOT,
         )
         while stream.poll() is None and manager.poll() is None:

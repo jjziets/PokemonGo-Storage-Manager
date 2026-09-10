@@ -1,4 +1,5 @@
 """Offline native protocol, race, color and timing checks. No phone access."""
+# TRACEWEAVER: file-role=native-stream-verification; verifies=VER-STREAM-ACTIVITY-001; req=REQ-STREAM-001; trace=TRACE-STREAM-001
 from __future__ import annotations
 
 import ctypes as c
@@ -28,6 +29,10 @@ def libraries():
     bridge.pk_test_push.argtypes = [c.c_void_p, c.c_int64, *([c.c_int] * 6)]
     bridge.pk_test_push.restype = c.c_int
     bridge.pk_test_destroy.argtypes = [c.c_void_p]
+    bridge.pk_test_init_only.argtypes = [c.c_char_p, c.c_char_p]
+    bridge.pk_test_init_only.restype = c.c_void_p
+    bridge.pk_test_close.argtypes = [c.c_void_p]
+    bridge.sc_pk_activity_test_active_count.restype = c.c_uint
     reader = c.CDLL(str(READER))
     reader.pk_frame_open.argtypes = [c.c_int, c.c_size_t]
     reader.pk_frame_open.restype = c.c_void_p
@@ -90,11 +95,14 @@ def race_reader(path, ready, done, results):
 
 def compile_bridge():
     subprocess.run(["/usr/bin/clang", "-std=c11", "-O3", "-Wall", "-Wextra", "-Werror",
+        "-fno-objc-arc", "-DSC_PK_ACTIVITY_TEST",
         "-dynamiclib", f"-I{PACKAGE}", f"-I{SOURCE / 'app/src'}", f"-I{BUILD / 'app'}",
         "-I/opt/homebrew/opt/ffmpeg/include", "-I/opt/homebrew/opt/sdl3/include",
         str(PACKAGE / "test_bridge.c"), str(PACKAGE / "pokemgr_frame_sink.c"),
+        str(PACKAGE / "pokemgr_activity.m"),
         "-L/opt/homebrew/opt/ffmpeg/lib", "-L/opt/homebrew/opt/sdl3/lib",
         "-lavcodec", "-lavutil", "-lswscale", "-lSDL3", "-framework", "Accelerate",
+        "-framework", "Foundation",
         "-o", str(BRIDGE)], check=True)
 
 
@@ -104,11 +112,31 @@ def main():
     report = dict(checks=[], benchmarks={})
     with tempfile.TemporaryDirectory(prefix="pk-frame-offline-") as tmp:
         tmp = Path(tmp)
+        # TRACEWEAVER: req=REQ-STREAM-001; trace=TRACE-STREAM-001
+        active = bridge.sc_pk_activity_test_active_count
+        nonce = b"0123456789abcdef0123456789abcdef"
+        assert active() == 0
+        assert not bridge.pk_test_init_only(b"relative.bin", nonce)
+        assert not bridge.pk_test_init_only(os.fsencode(tmp / "invalid.bin"), b"bad")
+        assert active() == 0
+        initialized = bridge.pk_test_init_only(os.fsencode(tmp / "init-only.bin"), nonce)
+        assert initialized and active() == 1
+        bridge.pk_test_close(initialized)
+        assert active() == 0
+        bridge.pk_test_close(initialized)
+        bridge.pk_test_destroy(initialized)
+        assert active() == 0
+        initialized = bridge.pk_test_init_only(os.fsencode(tmp / "destroy-only.bin"), nonce)
+        assert initialized and active() == 1
+        bridge.pk_test_destroy(initialized)
+        assert active() == 0
+        report["checks"].append("activity starts only on valid init and ends once on close/destroy")
         path = tmp / "valid.bin"
         handle = bridge.pk_test_create(os.fsencode(path), 256, 256, 1)
-        assert handle
+        assert handle and active() == 1
         assert os.stat(path).st_mode & 0o777 == 0o600
         assert not bridge.pk_test_create(os.fsencode(path), 256, 256, 1)
+        assert active() == 1  # Failed duplicate open releases only its own activity.
         buf = Buffer(path, reader)
         assert buf.mm[:8] == b"PKFRM001"
         assert struct.unpack_from("<6I", buf.mm, 8) == (1, 128, 30, 256, 256, 3)
@@ -127,6 +155,7 @@ def main():
         assert buf.copy(1)[0] == 0 and buf.copy(31)[0] == 0
         assert buf.copy(32)[0] == 1 and buf.copy(61)[0] == 1
         bridge.pk_test_destroy(handle)
+        assert active() == 0
         assert struct.unpack_from("<I", buf.mm, 56)[0] == 2
         buf.close()
         report["checks"] += ["30-frame wrap rejects overwritten sequences", "closed status"]
@@ -134,10 +163,13 @@ def main():
         for label, pts, fault in [("shape", 1, 1), ("HDR", 1, 2), ("PTS", -1, 0)]:
             path = tmp / (label + ".bin")
             handle = bridge.pk_test_create(os.fsencode(path), 16, 16, 0)
+            assert handle and active() == 1
             buf = Buffer(path, reader)
             assert not bridge.pk_test_push(handle, pts, 16, 128, 128, 1, 0, fault)
+            assert active() == 0  # Release on failure, before eventual destruction.
             assert not bridge.pk_test_push(handle, 2, 16, 128, 128, 1, 0, 0)
             bridge.pk_test_destroy(handle)
+            assert active() == 0
             assert struct.unpack_from("<I", buf.mm, 56)[0] == 3
             buf.close()
             report["checks"].append(label + " error remains failed closed")
@@ -164,6 +196,7 @@ def main():
         report["checks"].append("YUV range endpoints and matrix selection")
         bridge.pk_test_destroy(handle)
         buf.close()
+        assert active() == 0
 
         path = tmp / "race.bin"
         handle = bridge.pk_test_create(os.fsencode(path), 512, 512, 1)

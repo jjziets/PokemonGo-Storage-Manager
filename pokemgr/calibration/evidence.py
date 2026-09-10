@@ -205,12 +205,21 @@ def confirm_calibration_evidence(
     """Confirm a manifest after an explicit, bounded known-truth scan."""
     manifest_path = Path(manifest_path)
     manifest = json.loads(manifest_path.read_text())
-    manifest_fingerprint = manifest.get("device", {}).get("fingerprint")
-    if manifest_fingerprint != profile.fingerprint:
+    device = manifest.get("device", {})
+    manifest_fingerprint = device.get("fingerprint")
+    if manifest_fingerprint not in (profile.fingerprint, profile.legacy_fingerprint):
         raise ValueError(
             f"Evidence is for {manifest_fingerprint!r}, not "
             f"{profile.fingerprint!r}"
         )
+    expected_device = {
+        "model": profile.device_model, "serial": profile.serial,
+        "resolution": profile.resolution, "density": profile.density,
+        "layout": profile.layout,
+    }
+    if any(type(device.get(key)) is not type(value) or device.get(key) != value
+           for key, value in expected_device.items()):
+        raise ValueError("Evidence device geometry does not match calibration profile")
     if len(known_truth) < 2:
         raise ValueError("At least two known-truth Pokemon are required")
 

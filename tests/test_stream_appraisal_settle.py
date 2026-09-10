@@ -1,5 +1,7 @@
 """One bounded stream window can supply both independent settled appraisals."""
 
+# TRACEWEAVER: file-role=stream-appraisal-settle-tests; req=REQ-SCAN-002; trace=TRACE-SCAN-002; verifies=VER-SCAN-001
+
 import unittest
 from unittest.mock import Mock, patch
 
@@ -33,6 +35,7 @@ class StreamAppraisalSettleTests(unittest.TestCase):
         self.sm = IndexingStateMachine(self.adb, profile(), Mock())
         self.sm.nav.detect_screen = Mock(side_effect=lambda image: image.info["screen"])
         self.sm.reader.are_bars_visible = Mock(side_effect=lambda image: image.info["bars"])
+        self.sm.reader.appraisal_bars_stable = Mock(return_value=True)
         self.sm._fast_screencap = Mock(side_effect=AssertionError("Unexpected legacy capture"))
         self.enterContext(patch("pokemgr.indexer.state_machine.time.monotonic_ns", return_value=NOW_NS))
         self.enterContext(patch("pokemgr.indexer.state_machine.random.uniform", return_value=.15))
@@ -90,6 +93,21 @@ class StreamAppraisalSettleTests(unittest.TestCase):
         result, status = self.sm._wait_for_stable_appraisal(prior, require_transition=True)
         self.assertIs(result, newest)
         self.assertEqual(status, "stable")
+
+    # TRACEWEAVER: entrypoint=test_moving_bars_delay_settle_without_extra_wait; req=REQ-SCAN-002; trace=TRACE-SCAN-002; ver=VER-SCAN-001
+    def test_moving_bars_delay_settle_without_extra_wait(self):
+        first, moving, settled = frame(), frame(2, 160_000), frame(3, 310_000)
+        self.windows([[first, moving, settled]])
+        self.sm.reader.appraisal_bars_stable.side_effect = [False, True]
+
+        result, status = self.sm._wait_for_stable_appraisal()
+
+        self.assertEqual("stable", status)
+        self.assertIs(result, settled)
+        self.assertEqual((moving, settled), self.sm._settled_frame_pair)
+        self.assertEqual(2, self.sm.reader.appraisal_bars_stable.call_count)
+        self.delay.assert_not_called()
+        self.assert_no_input()
 
     def test_no_transition_after_six_comparisons_still_fails_strict_callers(self):
         images = [frame(i + 1, 10_000 + i * 150_000) for i in range(7)]

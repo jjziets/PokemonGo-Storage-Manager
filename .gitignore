@@ -33,6 +33,7 @@ calibrations/
 cache/
 logs/
 graphify-out/
+.memsearch/
 
 # Environment files with secrets
 .env

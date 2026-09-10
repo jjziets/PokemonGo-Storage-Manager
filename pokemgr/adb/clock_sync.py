@@ -17,6 +17,7 @@ import threading
 from time import monotonic_ns
 
 
+# TRACEWEAVER: file-role=source-clock-bounds; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
 DEFAULT_REMOTE_JAR = "/data/local/tmp/pokemgr-clock.jar"
 _REPLY = re.compile(
     r"POKEMGR_CLOCK_V1 ([0-9a-f]{32}) "
@@ -247,6 +248,7 @@ class FrameTimeBounds:
     latest_ns: int
     sync_generation: int
     valid_until_ns: int
+    continuity_token: str | None = None
 
     @property
     def uncertainty_ns(self):
@@ -276,6 +278,8 @@ class AndroidClockSync:
     Refresh before max_age_ns (30s by default). The default 1000ppm relative
     drift budget widens both interval ends; it never improves measured RTT.
     Use generation to discard bounds created before any resync/invalidation.
+    Continuity is separate evidence: compatible refreshes retain its token,
+    while invalidation, failure or an expired sample-coverage gap rotates it.
     """
 
     def __init__(self, *, max_age_ns=30_000_000_000, max_rtt_ns=1_000_000_000,
@@ -288,6 +292,7 @@ class AndroidClockSync:
         self.max_drift_ppm = max_drift_ppm
         self._mapping = None
         self._generation = 0
+        self._continuity_token = secrets.token_hex(16)
         self._lock = threading.RLock()
 
     @property
@@ -295,10 +300,16 @@ class AndroidClockSync:
         with self._lock:
             return self._generation
 
+    @property
+    def continuity_token(self):
+        with self._lock:
+            return self._continuity_token
+
     def invalidate(self):
         with self._lock:
             self._mapping = None
             self._generation += 1
+            self._continuity_token = secrets.token_hex(16)
 
     def _fail(self, reason):
         self.invalidate()
@@ -309,6 +320,7 @@ class AndroidClockSync:
         denominator = 1_000_000 - self.max_drift_ppm
         return (abs(elapsed_ns) * self.max_drift_ppm + denominator - 1) // denominator
 
+    # TRACEWEAVER: entrypoint=AndroidClockSync.observe; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
     def observe(self, sample):
         """Intersect compatible samples; reject clock changes instead of guessing."""
         with self._lock:
@@ -339,10 +351,15 @@ class AndroidClockSync:
                 high = min(high, previous.offset_high_ns + spread)
                 if low > high:
                     self._fail("Host/device clock offset changed outside its bounds")
+                if elapsed > self.max_age_ns:
+                    # Compatibility can establish a new mapping, but cannot
+                    # retroactively fill a gap in source-clock coverage.
+                    self._continuity_token = secrets.token_hex(16)
             self._mapping = _Mapping(sample, low, high)
             self._generation += 1
             return self._generation
 
+    # TRACEWEAVER: entrypoint=AndroidClockSync.map_pts_us; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
     def map_pts_us(self, pts_us, *, now_ns=None, received_ns=None):
         """Map original source microseconds, retaining full uncertainty.
 
@@ -373,4 +390,5 @@ class AndroidClockSync:
             if earliest > received:
                 self._fail("Source PTS is ahead of receipt; wrong clock or transformed timestamp")
             return FrameTimeBounds(earliest, min(latest, received), self._generation,
-                                   sample.host_receive_ns + self.max_age_ns)
+                                   sample.host_receive_ns + self.max_age_ns,
+                                   self._continuity_token)

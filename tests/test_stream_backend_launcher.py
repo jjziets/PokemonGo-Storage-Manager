@@ -1,4 +1,5 @@
 """Paired stream launcher setup and cleanup with every process/device mocked."""
+# TRACEWEAVER: file-role=stream-launcher-verification; verifies=VER-STREAM-ACTIVITY-001; req=REQ-STREAM-001; trace=TRACE-STREAM-001
 
 import io
 import hashlib
@@ -14,7 +15,7 @@ from scripts import stream_pokemon
 
 
 class StreamBackendLauncherTests(unittest.TestCase):
-    def launch(self, *, backend=None, failure=False):
+    def launch(self, *, backend=None, failure=False, native=False):
         stale = {key: "stale" for key in stream_pokemon.SESSION_ENVIRONMENT}
         self.enterContext(patch.dict(os.environ, stale))
         adb = Mock(serial="phone", adb_path="/mock/adb")
@@ -58,6 +59,8 @@ class StreamBackendLauncherTests(unittest.TestCase):
         args = ["stream_pokemon.py", "--serial", "phone"]
         if backend:
             args.extend(("--capture-backend", backend))
+        if native:
+            args.append("--native-display")
         with patch.object(stream_pokemon.sys, "argv", args), \
              patch.object(stream_pokemon.shutil, "which", return_value="/mock/system-scrcpy"), \
              patch.object(stream_pokemon, "_prepare_stream_tools", return_value=(
@@ -93,6 +96,8 @@ class StreamBackendLauncherTests(unittest.TestCase):
         stream_command, stream_args = launches[0]
         _, gui_args = launches[1]
         self.assertEqual(stream_command[0], "/mock/local/app/scrcpy")
+        self.assertIn("--new-display=968x2376/420", stream_command)
+        self.assertIn("--no-downsize-on-error", stream_command)
         writer, reader = stream_args["env"], gui_args["env"]
         self.assertEqual(writer["ADB"], "/mock/adb")
         self.assertEqual(reader["POKEMGR_FRAME_BUFFER"], writer["POKEMGR_FRAME_BUFFER"])
@@ -100,6 +105,8 @@ class StreamBackendLauncherTests(unittest.TestCase):
         self.assertEqual(reader["POKEMGR_STREAM_PID"], "12345")
         self.assertEqual(reader["POKEMGR_FRAME_READER"], "/mock/local/libpk_frame_reader.dylib")
         self.assertEqual(reader["POKEMGR_NATIVE_OCR"], "1")
+        self.assertEqual(reader["POKEMGR_EXPECTED_DISPLAY_GEOMETRY"], "968x2376/420")
+        self.assertNotIn("POKEMGR_EXPECTED_DISPLAY_GEOMETRY", writer)
         self.assertEqual(reader["POKEMGR_CAPTURE_FORMAT"], "jpeg")
         self.assertEqual((reader["POKEMGR_DISPLAY_ID"], reader["POKEMGR_CAPTURE_DISPLAY_ID"]), ("15", "115"))
         self.assertFalse(Path(reader["POKEMGR_FRAME_BUFFER"]).parent.exists())
@@ -113,6 +120,12 @@ class StreamBackendLauncherTests(unittest.TestCase):
                         "POKEMGR_FRAME_READER", "POKEMGR_NATIVE_OCR"):
                 self.assertNotIn(key, arguments["env"])
         self.assertEqual(launches[1][1]["env"]["POKEMGR_CAPTURE_FORMAT"], "jpeg")
+        self.assertIn("--new-display=968x2376/420", launches[0][0])
+
+    def test_native_layout_is_an_explicit_override_and_still_binds_expected_geometry(self):
+        launches, _ = self.launch(native=True)
+        self.assertIn("--new-display=96x128/420", launches[0][0])
+        self.assertEqual(launches[1][1]["env"]["POKEMGR_EXPECTED_DISPLAY_GEOMETRY"], "96x128/420")
 
     def test_failed_gui_launch_cleans_private_directory_after_stopping_stream(self):
         launches, events = self.launch(failure=True)

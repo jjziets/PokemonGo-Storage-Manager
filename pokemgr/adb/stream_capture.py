@@ -7,6 +7,7 @@ from .clock_sync import AndroidClockSync, ClockSampler
 from .frame_buffer import FrameBuffer
 
 
+# TRACEWEAVER: file-role=fresh-stream-capture; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
 class StreamCaptureTimeout(RuntimeError):
     pass
 
@@ -66,6 +67,7 @@ class StreamCapture:
         with self._lock:
             return self._epoch
 
+    # TRACEWEAVER: entrypoint=StreamCapture._image; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
     def _image(self, sequence, *, after_ns, max_age_ns=250_000_000, epoch=None):
         frame = self.buffer.read(sequence)
         if frame is None:
@@ -86,6 +88,7 @@ class StreamCapture:
                 pokemgr_capture_started_at=bounds.earliest_ns / 1e9,
                 pokemgr_capture_finished_at=bounds.latest_ns / 1e9,
                 pokemgr_source_clock_generation=bounds.sync_generation,
+                pokemgr_source_clock_continuity=bounds.continuity_token,
             )
             return frame.image
 
@@ -95,11 +98,16 @@ class StreamCapture:
         requested_ns = time.monotonic_ns()
         self._synchronize()
         deadline = time.monotonic() + timeout
+        considered = self._last_sequence
         while time.monotonic() < deadline:
             if epoch != self._current_epoch():
                 raise StreamCaptureTimeout("Stream capture was invalidated")
             latest = self.buffer.latest_sequence
-            if latest > self._last_sequence:
+            if latest > considered:
+                # Published slots are immutable until overwritten. Rejected
+                # source pixels cannot become newer while this request waits;
+                # a raced overwrite also requires a later sequence.
+                considered = latest
                 image = self._image(latest, after_ns=requested_ns, epoch=epoch)
                 if image is not None:
                     if epoch != self._current_epoch():

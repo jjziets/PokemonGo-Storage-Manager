@@ -1,3 +1,5 @@
+# TRACEWEAVER: file-role=inventory-queue-gui; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+# TRACEWEAVER: entrypoint=start_scan_queue; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 """Main application window with tabbed interface."""
 
 import logging
@@ -255,6 +257,47 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Database cleared — ready for fresh scan")
 
     # ── Scanning ─────────────────────────────────────────────────────
+
+    # TRACEWEAVER: entrypoint=start_scan_queue; req=REQ-SCAN-003,REQ-DATA-001; trace=TRACE-SCAN-003,TRACE-DATA-001; ver=VER-SCAN-001
+    def start_scan_queue(self, ledger_path):
+        """Launch explicitly reconciled partitions using the controllable scan worker."""
+        from ..indexer.scan_queue import load_scan_queue
+
+        if MainWindow._running_device_workers(self):
+            self.scan_tab.on_error("Stop the current operation before starting an inventory queue")
+            return
+        try:
+            selected_passes = load_scan_queue(ledger_path)
+        except ValueError as exc:
+            self.scan_tab.on_error(f"Scan queue not started: {exc}")
+            return
+        if not self._connect_device(show_errors=False, allow_default_profile=False):
+            return
+        if MainWindow._running_device_workers(self):
+            self.scan_tab.on_error("An operation started while connecting; inventory queue held")
+            return
+        try:
+            if load_scan_queue(ledger_path) != selected_passes:
+                raise ValueError("inventory queue changed while connecting; review it before retrying")
+        except ValueError as exc:
+            self.scan_tab.on_error(f"Scan queue not started: {exc}")
+            return
+        tab = self.scan_tab
+        tab.max_pokemon_spin.setValue(0)
+        tab.skip_spin.setValue(0)
+        tab.resume_species.setText("")
+        tab.resume_cp.setValue(0)
+        tab.unfavorite_check.setChecked(False)
+        self._scan_worker = ScanWorker(self.adb, self.profile, self.db,
+                                       unfavorite=False, max_pokemon=0)
+        self._scan_worker.selected_passes = selected_passes
+        self._scan_worker.skip_first_n = 0
+        self._scan_worker.skip_delay = tab.skip_delay_spin.value()
+        self._scan_worker.resume_target_species = ""
+        self._scan_worker.resume_target_cp = 0
+        log.info("Starting explicit inventory queue from %s: %s", ledger_path,
+                 [(entry["name"], entry["query"]) for entry in selected_passes])
+        self._start_scan_worker()
 
     def start_default_scan(self, *, skip_first: int = 0,
                            resume_species: str = "", resume_cp: int = 0):
@@ -534,6 +577,7 @@ class MainWindow(QMainWindow):
             if pvp_db is not None:
                 pvp_db.close()
 
+    # TRACEWEAVER: entrypoint=_start_favorite; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
     def _start_favorite(self, dry_run: bool = False, *, from_mass: bool = False):
         if MainWindow._running_device_workers(self):
             QMessageBox.warning(self, "Operation Running", "Stop the current operation before starting another.")
@@ -542,12 +586,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Not Connected", "Connect to a device first.")
             return
 
-        all_pokemon = self.db.get_all()
-        keepers = [p for p in all_pokemon if p.decision == "KEEP"]
-        need_fav = [p for p in keepers if not p.favorited]
+        from ..execution.executor import Executor
+        plan = Executor.plan_keeper_favorites(self.db.get_all())
 
-        if not need_fav:
-            QMessageBox.information(self, "All Done", "All keepers are already favorited.")
+        if not plan.unstarred:
+            QMessageBox.information(
+                self, "No Unstarred Keepers",
+                f"KEEP records: {plan.total:,}\n"
+                f"Already favorited (recorded): {plan.already_favorited:,}\n\n"
+                "No unstarred keeper records to match. Phone state has not been checked.",
+            )
             return
 
         selected_passes = self.decision_tab.get_selected_fav_passes()
@@ -557,10 +605,17 @@ class MainWindow(QMainWindow):
         mode = "DRY RUN (test)" if dry_run else "FOR REAL"
         reply = QMessageBox.question(
             self, f"Favorite Keepers — {mode}",
-            f"Will {'simulate' if dry_run else 'favorite'} {len(need_fav)} keepers.\n\n"
+            f"KEEP records: {plan.total:,}\n"
+            f"Already favorited (recorded): {plan.already_favorited:,}\n"
+            f"Unstarred (recorded): {plan.unstarred:,}\n\n"
+            f"Of the unstarred records:\n"
+            f"Eligible before pass/live checks: {plan.eligible:,}\n"
+            f"Held for review: {plan.ambiguous:,}\n\n"
             f"Passes: {', '.join(selected_passes)}\n\n"
-            f"Matches validated species/form, CP, HP and IVs; names may be nicknames.\n\n"
-            f"{'No stars will be tapped.' if dry_run else 'Will tap the star on matches.'}\n\n"
+            f"Searches pending keeper CP values and excludes existing favorites on the phone.\n"
+            f"Only selected-pass matches with validated species/form, CP, HP and IVs qualify; "
+            f"names may be nicknames. Recorded favorites may differ from the phone.\n\n"
+            f"{'No stars will be tapped.' if dry_run else 'Will tap the star only on confirmed unstarred matches.'}\n\n"
             f"Start?",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -608,7 +663,12 @@ class MainWindow(QMainWindow):
             return
         if getattr(self, '_fav_stop_requested', False):
             self._fav_result['aborted'] = True
+        if getattr(worker, 'dry_run', False) is True:
+            self._fav_result['dry_run'] = True
         self._fav_completed_worker = worker
+        if not self._fav_result.get('dry_run'):
+            self._refresh_collection()
+            self._refresh_decisions()
         self.decision_tab.on_fav_finished(self._fav_result)
         MainWindow._on_favorite_finished(self, self._fav_result)
 
@@ -728,7 +788,12 @@ class MainWindow(QMainWindow):
             return
         if getattr(self, '_mass_stop_requested', False):
             self._mass_result['aborted'] = True
+        if getattr(worker, 'dry_run', False) is True:
+            self._mass_result['dry_run'] = True
         self._mass_completed_worker = worker
+        if not self._mass_result.get('dry_run'):
+            self._refresh_collection()
+            self._refresh_decisions()
         self.mass_tab.on_finished(self._mass_result)
 
     def _stop_mass_action(self):
@@ -780,22 +845,35 @@ class MainWindow(QMainWindow):
         fav = result.get("unfavorited" if unfavorite else "favorited", 0)
         skip = result.get("skipped", 0)
         unresolved = result.get("unresolved", result.get("unmatched", 0))
+        database_counts = []
+        if not result.get('dry_run'):
+            for key, label in (("db_synced", "Favorite status saved"),
+                               ("db_unresolved", "Favorite status not saved")):
+                if type(result.get(key)) is int:
+                    database_counts.append(f"{label}: {result[key]}")
+        database_unresolved = (not result.get('dry_run')
+                               and type(result.get('db_unresolved')) is int
+                               and result['db_unresolved'] > 0)
         has_error = 'error' in result and result['error'] is not None
         mode = "Dry Run" if result.get('dry_run') else action
         title = (f"{mode} Failed" if has_error else f"{mode} Stopped"
                  if result.get('aborted') else "Dry Run Complete" if result.get('dry_run')
                  else f"{action} Complete")
-        if not has_error and not result.get('aborted') and (unresolved or result.get('ambiguous')):
+        if not has_error and not result.get('aborted') and (unresolved or result.get('ambiguous') or database_unresolved):
             title += " — Needs Review"
-        count_label = "Unfavorited" if unfavorite else "Would favorite" if result.get('dry_run') else "Favorited"
+        count_label = (("Would unfavorite" if unfavorite else "Would favorite") if result.get('dry_run')
+                       else "Unfavorited" if unfavorite else "Favorited")
         detail = f"\nError: {result['error'] or 'Operation failed without an error message'}" if has_error else ""
+        if database_counts:
+            detail += "\n" + "\n".join(database_counts)
         if result.get('note'):
             detail += f"\n{result['note']}"
         QMessageBox.information(
             self, title,
             f"{count_label}: {fav} Pokémon\nSkipped: {skip}\nUnresolved: {unresolved}{detail}"
         )
-        self.statusBar().showMessage(f"{title}: {fav} matched, {skip} skipped, {unresolved} unresolved")
+        database_status = ", " + ", ".join(database_counts) if database_counts else ""
+        self.statusBar().showMessage(f"{title}: {fav} matched, {skip} skipped, {unresolved} unresolved{database_status}")
 
     def _refresh_battery(self):
         """Refresh battery level and connection status."""

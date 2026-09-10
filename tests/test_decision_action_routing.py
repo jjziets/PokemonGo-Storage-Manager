@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QMessageBox
 
 from pokemgr.gui.main_window import MainWindow
 from tests.test_mass_action_gui import window, worker
+from tests.test_mass_action_scanning import pokemon
 
 
 def decision_window():
@@ -19,6 +20,47 @@ def decision_window():
 
 
 class DecisionActionRoutingTests(unittest.TestCase):
+    # TRACEWEAVER: entrypoint=test_confirmation_reconciles_all_keepers_without_starting_an_action; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
+    def test_confirmation_reconciles_all_keepers_without_starting_an_action(self):
+        for dry_run, from_mass in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(dry_run=dry_run, from_mass=from_mass):
+                target = decision_window()
+                target.db.get_all.return_value = (
+                    [pokemon(favorited=True) for _ in range(951)]
+                    + [pokemon() for _ in range(320)]
+                    + [pokemon(hp=0) for _ in range(31)]
+                    + [pokemon(cp=501, decision="TRANSFER")]
+                )
+                with patch('pokemgr.gui.main_window.QMessageBox.question', return_value=QMessageBox.No) as message, \
+                     patch('pokemgr.gui.workers.FavoriteWorker') as made:
+                    target._start_favorite(dry_run=dry_run, from_mass=from_mass)
+                body = message.call_args.args[2]
+                for line in ('KEEP records: 1,302', 'Already favorited (recorded): 951',
+                             'Unstarred (recorded): 351',
+                             'Eligible before pass/live checks: 320', 'Held for review: 31',
+                             'excludes existing favorites on the phone.',
+                             'validated species/form, CP, HP and IVs',
+                             'Passes: Normal, Shiny', 'Recorded favorites may differ from the phone.'):
+                    self.assertIn(line, body)
+                self.assertIn('No stars will be tapped.' if dry_run
+                              else 'Will tap the star only on confirmed unstarred matches.', body)
+                made.assert_not_called()
+                self.assertEqual([], target.adb.mock_calls)
+                target.mass_tab.set_running.assert_not_called()
+                target.decision_tab.set_favoriting.assert_not_called()
+
+    def test_all_recorded_favorites_does_not_claim_phone_verification(self):
+        target = decision_window()
+        target.db.get_all.return_value = [pokemon(favorited=True)]
+        with patch('pokemgr.gui.main_window.QMessageBox.information') as message, \
+             patch('pokemgr.gui.main_window.QMessageBox.question') as question, \
+             patch('pokemgr.gui.workers.FavoriteWorker') as made:
+            target._start_favorite()
+        self.assertIn('Already favorited (recorded): 1', message.call_args.args[2])
+        self.assertIn('Phone state has not been checked.', message.call_args.args[2])
+        question.assert_not_called()
+        made.assert_not_called()
+
     def test_dry_real_and_unfavorite_keep_progress_controls_and_cleanup_in_decisions(self):
         for kind in ('dry', 'real', 'unfavorite'):
             with self.subTest(kind=kind):

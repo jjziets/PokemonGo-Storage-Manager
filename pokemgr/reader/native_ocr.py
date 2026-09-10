@@ -1,3 +1,6 @@
+# TRACEWEAVER: file-role=native-appraisal-ocr; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+# TRACEWEAVER: file-role=native-gym-evidence; req=REQ-SCAN-001; trace=TRACE-SCAN-001; ver=VER-SCAN-001
+# TRACEWEAVER: file-role=native-gym-review-evidence; req=REQ-SCAN-004; trace=TRACE-SCAN-004; ver=VER-SCAN-001
 """Persistent macOS Vision OCR and strict, frame-bound appraisal text parsing.
 
 Vision chooses its compute device automatically. This module does not claim GPU
@@ -9,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from collections.abc import Collection
+from datetime import date
 import hashlib
 import json
 import math
@@ -71,6 +75,11 @@ class NativeFields:
     candy_family: str = ""
     candy_confidence: float = 0.0
     candy_conflict: bool = False
+    # Optional specimen evidence only; never species/CP resolver inputs.
+    specimen_weight: str = ""  # canonical decimal kilograms
+    specimen_height: str = ""  # canonical decimal metres
+    caught_date: str = ""      # ISO calendar date
+    in_gym: bool = False       # exact raid-in-progress status message
 
 
 _build_lock = threading.Lock()
@@ -315,6 +324,11 @@ _BARE_CP = re.compile(r"[1-9][0-9]{1,3}")
 _HP = re.compile(r"([0-9]{1,3})\s*/\s*([1-9][0-9]{1,2})\s*HP", re.IGNORECASE)
 _CAUGHT = re.compile(r"This\s+(.{2,40}?)\s+was\b", re.IGNORECASE)
 _LUCKY = re.compile(r"LUCKY POK[ÉE]MON", re.IGNORECASE)
+_MEASUREMENT = re.compile(r"(0|[1-9][0-9]{0,4})(?:[.,]([0-9]{1,3}))?\s*(kg|m)", re.IGNORECASE)
+_CAUGHT_DATE = re.compile(
+    r"This\s+(.{2,40}?)\s+was\s+caught\s+on\s+([0-9]{4})/([0-9]{2})/([0-9]{2})[.!]?",
+    re.IGNORECASE,
+)
 
 
 def _inside(observation: TextObservation, region: BBox) -> bool:
@@ -335,6 +349,91 @@ def _unique(values: list[tuple[object, float]], missing):
         return missing, 0.0
     value = next(iter(distinct))
     return value, max(confidence for observed, confidence in values if observed == value)
+
+
+# TRACEWEAVER: entrypoint=_raid_gym_message; req=REQ-SCAN-001; trace=TRACE-SCAN-001; ver=VER-SCAN-001
+# TRACEWEAVER: entrypoint=_raid_gym_message; req=REQ-SCAN-004; trace=TRACE-SCAN-004; ver=VER-SCAN-001
+def _raid_gym_message(frame: NativeFrameText) -> bool:
+    """Recognize the complete gym status, never a generic mention of a raid.
+
+    Fast Vision reads the measured two-line message at confidence 0.5. Its
+    exact sentence, contained status-card geometry and aligned lines supply
+    evidence without another OCR request or repaired/missing words.
+    """
+    sx, sy = frame.width / 968, frame.height / 2376
+    left, top, right, bottom = 175 * sx, 990 * sy, 905 * sx, 1125 * sy
+    lines = []
+    for item in frame.observations:
+        x, y, width, height = item.bbox
+        if not all(math.isfinite(value) for value in item.bbox):
+            return False
+        if x + width <= left or x >= right or y + height <= top or y >= bottom:
+            continue
+        if not (.5 <= item.confidence <= 1 and width > 0 and 15 * sy <= height <= 90 * sy
+                and left <= x and x + width <= right
+                and top <= y and y + height <= bottom):
+            return False
+        lines.append(item)
+    if not 1 <= len(lines) <= 2:
+        return False
+    lines.sort(key=lambda item: (item.bbox[1], item.bbox[0]))
+    if len(lines) == 2:
+        first, second = (item.bbox for item in lines)
+        if not (abs(first[0] - second[0]) <= 25 * sx
+                and 0 <= second[1] - first[1] - first[3] <= 25 * sy
+                and max(first[3], second[3]) <= 45 * sy):
+            return False
+    observed = " ".join(" ".join(item.text.split()) for item in lines).casefold()
+    observed = observed.replace("pokémon", "pokemon")
+    return observed == (
+        "raid in progress! your pokemon will return to "
+        "the gym once the raid is over."
+    )
+
+
+# TRACEWEAVER: entrypoint=_specimen_measurement; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+def _specimen_measurement(frame: NativeFrameText, region: BBox, *,
+                          label: str, unit: str, tablet: bool) -> str:
+    """Read a whole unit-bearing value directly above its calibrated label."""
+    sx = frame.width / (1440 if tablet else 968)
+    sy = frame.height / (2304 if tablet else 2376)
+    # Lucky adds a 50px row above these labels on the phone. Keep the
+    # calibrated column and a bounded allowance, not a whole-card text search.
+    left, right = max(0, region.x - 30 * sx), min(frame.width, region.x2 + 30 * sx)
+    top, bottom = region.y - 20 * sy, region.y2 + 60 * sy
+
+    def contained(observation, x1, y1, x2, y2):
+        x, y, w, h = observation.bbox
+        return (w > 0 and h > 0 and x1 <= x and y1 <= y
+                and x + w <= x2 and y + h <= y2)
+
+    labels = [item for item in frame.observations
+              if .85 <= item.confidence <= 1 and item.text.strip().upper() == label
+              and contained(item, left, top, right, bottom)
+              and 10 * sy <= item.bbox[3] <= 50 * sy]
+    values = []
+    for item in frame.observations:
+        if not .85 <= item.confidence <= 1:
+            continue
+        match = _MEASUREMENT.fullmatch(item.text.strip())
+        if not match or match.group(3).lower() != unit:
+            continue
+        x, y, w, h = item.bbox
+        if (not 12 * sy <= h <= 85 * sy
+                or not contained(item, left, max(0, top - 120 * sy), right, bottom)):
+            continue
+        if not any(
+            0 <= anchor.bbox[1] - (y + h) <= 40 * sy
+            and abs(x + w / 2 - (anchor.bbox[0] + anchor.bbox[2] / 2))
+                <= max(20 * sx, .3 * max(w, anchor.bbox[2]))
+            for anchor in labels
+        ):
+            continue
+        fraction = (match.group(2) or "").rstrip("0")
+        value = match.group(1) + ("." + fraction if fraction else "")
+        if value != "0":
+            values.append((value, item.confidence))
+    return _unique(values, "")[0]
 
 
 def _lucky_from_card(frame: NativeFrameText, name_boxes, hp_boxes, *, tablet: bool):
@@ -392,7 +491,7 @@ def parse_appraisal_fields(frame: NativeFrameText, regions: ScreenRegions, *,
     start, end = int(h * (.72 if tablet else .80)), int(h * .94) if tablet else h - 10
     caught_region = BBox(20, start, w - 40, end - start)
     expected = frozenset(expected_cps) if expected_cps is not None else None
-    cp_values, hp_values, names, caught_names = [], [], [], []
+    cp_values, hp_values, names, caught_names, caught_dates = [], [], [], [], []
     hp_boxes, name_boxes = [], []
     for observation in frame.observations:
         if observation.confidence < .5:
@@ -424,6 +523,19 @@ def parse_appraisal_fields(frame: NativeFrameText, regions: ScreenRegions, *,
             match = _CAUGHT.match(text)
             if match and (name := _name(match.group(1))):
                 caught_names.append((name, observation.confidence))
+                dated = _CAUGHT_DATE.fullmatch(text)
+                x, y, text_width, text_height = observation.bbox
+                line_scale = h / (2304 if tablet else 2376)
+                if (dated and .85 <= observation.confidence <= 1
+                        and caught_region.x <= x and x + text_width <= caught_region.x2
+                        and caught_region.y <= y and y + text_height <= caught_region.y2
+                        and 12 * line_scale <= text_height <= 80 * line_scale):
+                    try:
+                        observed_date = date(*map(int, dated.groups()[1:])).isoformat()
+                    except ValueError:
+                        pass
+                    else:
+                        caught_dates.append((observed_date, observation.confidence))
     cp, cp_conf = _unique(cp_values, -1)
     hp, hp_conf = _unique(hp_values, -1)
     name, name_conf = _unique(names, "")
@@ -434,7 +546,14 @@ def parse_appraisal_fields(frame: NativeFrameText, regions: ScreenRegions, *,
     candy, candy_conf, candy_conflict = parse_candy_observations(
         ((item.text, item.confidence, item.bbox) for item in frame.observations), w, h,
     )
+    weight = _specimen_measurement(frame, regions.weight_label_region,
+                                  label="WEIGHT", unit="kg", tablet=tablet)
+    height = _specimen_measurement(frame, regions.height_label_region,
+                                  label="HEIGHT", unit="m", tablet=tablet)
+    caught_date = _unique(caught_dates, "")[0] if caught else ""
     return NativeFields(cp, hp, name, caught, cp_conf, hp_conf, name_conf, caught_conf,
                         cp_conflict=len({value for value, _ in cp_values}) > 1,
                         lucky=lucky, candy_family=candy, candy_confidence=candy_conf,
-                        candy_conflict=candy_conflict)
+                        candy_conflict=candy_conflict, specimen_weight=weight,
+                        specimen_height=height, caught_date=caught_date,
+                        in_gym=_raid_gym_message(frame))

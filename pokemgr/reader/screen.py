@@ -1,3 +1,4 @@
+# TRACEWEAVER: file-role=appraisal-screen-reader; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 """ScreenReader facade — combines OCR, bar reading, and icon detection."""
 
 import logging
@@ -175,6 +176,63 @@ class ScreenReader:
         # live source object itself owns this evidence without keeping it alive.
         image.info["pokemgr_native_owner"] = (weakref.ref(self), weakref.ref(image), image.size)
         return fields
+
+    # TRACEWEAVER: entrypoint=specimen_markers; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+    def specimen_markers(self, image) -> tuple[str, str, str]:
+        """Read optional specimen details only for an ambiguous transition.
+
+        Fast Vision often assigns 0.5 confidence to these small labels. An
+        accurate pass on the same pixels supplies the rare fallback without
+        adding OCR work to normal, different-stat transitions. Neither pass
+        can make a copied image inherit evidence from its source object.
+        """
+        names = ("specimen_weight", "specimen_height", "caught_date")
+        cached = image.info.get("pokemgr_specimen_markers")
+        if isinstance(cached, tuple) and len(cached) == 4:
+            reader_ref, image_ref, size, markers = cached
+            if (isinstance(reader_ref, weakref.ReferenceType) and reader_ref() is self
+                    and isinstance(image_ref, weakref.ReferenceType) and image_ref() is image
+                    and size == image.size):
+                return markers
+        fields = self.native_fields(image)
+        markers = tuple(getattr(fields, name, "") for name in names)
+        if not all(markers) and self._native_ocr is not None:
+            from .native_ocr import NativeFrameText, NativeOCRError, parse_appraisal_fields
+            try:
+                raw = self._native_ocr.recognize(
+                    image, frame_id=str(id(image)), mode="accurate",
+                )
+                if (not isinstance(raw, NativeFrameText) or raw.frame_id != str(id(image))
+                        or (raw.width, raw.height) != image.size):
+                    raise NativeOCRError("Specimen OCR response belongs to another frame")
+                fast = image.info.get("pokemgr_native_text")
+                if fast is not None:
+                    if (not isinstance(fast, NativeFrameText) or fast.frame_id != str(id(image))
+                            or (fast.width, fast.height) != image.size):
+                        raise NativeOCRError("Specimen fast OCR belongs to another frame")
+                    # Parse the observations together: an empty parsed field
+                    # could mean conflicting evidence, not just missing text.
+                    raw = replace(raw, observations=fast.observations + raw.observations)
+                accurate = parse_appraisal_fields(raw, self.regions, density=self._density)
+                markers = tuple(getattr(accurate, name, "") for name in names)
+            except (NativeOCRError, ValueError) as exc:
+                log.debug("Specimen detail OCR unavailable: %s", exc)
+                markers = ("", "", "")
+        image.info["pokemgr_specimen_markers"] = (
+            weakref.ref(self), weakref.ref(image), image.size, markers,
+        )
+        return markers
+
+    def specimen_gender(self, image) -> str:
+        """Optional clear glyph evidence, independent of the display classifier."""
+        from ..calibration.regions import BBox
+        from .gender import detect_gender_evidence
+        region = self.regions.gender_region
+        # The historic icon crop clips the low cross on the current app card.
+        # Retain its columns and extend just enough to include the whole glyph.
+        height = min(region.h + round(30 * self.regions.screen_height / 2376),
+                     image.height - region.y)
+        return detect_gender_evidence(image, BBox(region.x, region.y, region.w, height))
 
     def _native_cp_refinement(self, image, raw):
         """One accurate, contextual CP crop; keep its evidence separate."""
@@ -368,6 +426,15 @@ class ScreenReader:
             "sta": sta,
             "confidence": (atk_conf + def_conf + sta_conf) / 3,
         }
+
+    # TRACEWEAVER: entrypoint=ScreenReader.appraisal_bars_stable; req=REQ-SCAN-002; trace=TRACE-SCAN-002; ver=VER-SCAN-001
+    def appraisal_bars_stable(self, first: Image.Image, second: Image.Image) -> bool:
+        """Require the narrow IV bars to stop filling before reading stats."""
+        r = self.regions
+        return bars.appraisal_bars_stable(
+            first, second,
+            fallback_regions=(r.atk_bar_region, r.def_bar_region, r.sta_bar_region),
+        )
 
     def read_pokemon(self, detail_img: Image.Image,
                      appraisal_img: Image.Image,

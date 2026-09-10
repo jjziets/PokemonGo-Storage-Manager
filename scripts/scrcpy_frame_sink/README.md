@@ -17,6 +17,9 @@ contacts a phone. The result manifest is
 `cache/scrcpy-frame-build/pokemgr-build.json`; it records input hashes, the client
 path, native reader library path, and pinned portable icon hashes. The build depends on the current
 Homebrew libraries, so it is source reproducible rather than byte reproducible.
+Cached patch upgrades require an exact match to the previous successful build
+manifest. Unrelated source edits are preserved. The launcher and builder share
+the input list, including the Objective-C activity helper.
 
 To enable export, the launcher supplies both environment variables:
 
@@ -29,6 +32,9 @@ To enable export, the launcher supplies both environment variables:
 With neither variable, normal client behavior is preserved. Partial settings
 fail. Export mode enables video decoding even if playback is disabled. The
 macOS build disables V4L2, leaving room for the preview and exporter sinks.
+While export is active, a retained Foundation activity token declares
+user-requested work and prevents App Nap/deferral. It permits idle system
+sleep, does not keep the Mac display awake, and ends on failure or cleanup.
 Shape/session changes, unsupported HDR, missing PTS, or conversion failures mark
 the buffer erroneous and terminate delivery. There is no cached-image fallback.
 

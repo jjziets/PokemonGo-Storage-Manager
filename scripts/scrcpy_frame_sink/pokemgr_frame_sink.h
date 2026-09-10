@@ -1,3 +1,4 @@
+/* TRACEWEAVER: file-role=native-frame-export-api; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-STREAM-ACTIVITY-001 */
 #ifndef SC_POKEMGR_FRAME_SINK_H
 #define SC_POKEMGR_FRAME_SINK_H
 
@@ -69,6 +70,7 @@ struct sc_pk_frame_sink {
     struct sc_pk_frame_header *header;
     struct SwsContext *converter;
     void *argb_buffer;
+    void *activity;
     uint64_t sequence;
     int source_colorspace;
     int source_range;

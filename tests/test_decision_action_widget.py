@@ -219,6 +219,8 @@ class DecisionActionWidgetTests(unittest.TestCase):
         self.assertEqual(self.panel.get_selected_fav_passes(), passes)
         self.assertIn("stored scan stats", self.panel.run_engine_btn.toolTip())
         self.assertIn("Nicknames do not determine matches", self.panel.favorite_real_btn.toolTip())
+        for button in (self.panel.approve_btn, self.panel.favorite_real_btn):
+            self.assertIn("existing favorites on the phone", button.toolTip())
 
 
 if __name__ == "__main__":

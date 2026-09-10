@@ -143,17 +143,19 @@ class ResourceSamplerTests(unittest.TestCase):
         replacement.replace(self.frame_path)
         self.assertEqual([r.pid for r in self.sampler.sample().processes], [10])
 
-    def test_gpu_remains_unavailable_and_tooltip_reports_each_process(self):
+    def test_gpu_is_unmeasured_and_tooltip_reports_each_process(self):
         snapshot = ResourceSnapshot((ProcessUsage(10, "App", 10., 2**30),
                                      ProcessUsage(20, "OCR", 80., 2**20)))
         summary, detail = resource_text(snapshot)
         self.assertIn("CPU 90.0%", summary)
-        self.assertIn("GPU unavailable", summary)
+        self.assertIn("GPU usage not measured", summary)
         self.assertIn("<td>10</td><td>10.0%</td>", detail)
         self.assertIn("<td>20</td><td>80.0%</td>", detail)
         self.assertIn("100% = one core", detail)
         self.assertIn("shared pages", detail)
-        self.assertIn("privileged profiling", detail)
+        self.assertIn("GPU acceleration can still be active", detail)
+        self.assertIn("requires administrator access", detail)
+        self.assertIn("this app does not run it", detail)
         summary, _ = resource_text(ResourceSampler(backend=None).sample())
         self.assertIn("CPU unavailable", summary)
 

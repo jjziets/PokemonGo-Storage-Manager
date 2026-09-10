@@ -24,23 +24,56 @@ FIRST_GRID_ITEM = (160, 550)
 SEARCH_BAR = (484, 300)
 
 
+# TRACEWEAVER: entrypoint=map-screen-marker; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 def _has_pokeball(arr: np.ndarray) -> bool:
-    """Check if the red pokeball is visible at bottom center.
-    The red top-half has pixels RGB ~(255, 57, 70) around y=2220, x=460-500."""
+    """Require the map button's red hemisphere, white base and neutral center."""
+    import cv2
+
     h, w = arr.shape[:2]
-    # Check a broad normalized area around the map's bottom-center Pokeball.
-    # Tablet UI places it noticeably higher than the Fold cover-screen layout.
-    y_start = int(h * 0.84)
-    y_end = int(h * 0.94)
-    x_start = int(w * 0.44)
-    x_end = int(w * 0.56)
-    if y_end > h or x_end > w:
+    if arr.ndim != 3 or arr.shape[2] < 3 or min(h, w) < 40:
         return False
-    region = arr[y_start:y_end, x_start:x_end]
-    # Count very red pixels (R>200, G<120, B<120)
-    red_mask = (region[:, :, 0] > 200) & (region[:, :, 1] < 120) & (region[:, :, 2] < 120)
-    red_ratio = np.sum(red_mask) / red_mask.size
-    return red_ratio > 0.03
+    # Include the whole button, including the higher tablet position. A narrow
+    # center crop would turn a wide Max Moves banner into a ball-shaped strip.
+    x_start, x_end = int(w * 0.30), int(w * 0.70)
+    y_start, y_end = int(h * 0.82), int(h * 0.97)
+    region = arr[y_start:y_end, x_start:x_end, :3]
+    red = ((region[:, :, 0] > 200) & (region[:, :, 1] < 120)
+           & (region[:, :, 2] < 120)).astype(np.uint8)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(red, 8)
+    for component in range(1, count):
+        x, y, width, height, area = stats[component]
+        if not (w * 0.04 <= width <= w * 0.18
+                and 0.35 <= height / width <= 0.65
+                and 0.45 <= area / (width * height) <= 0.85):
+            continue
+        center_x = x_start + x + width / 2
+        bottom_y = y_start + y + height
+        if abs(center_x - w / 2) > w * 0.025:
+            continue
+        # The curved upper edge narrows towards the pole; a red rectangle or
+        # ribbon with a similarly sized bounding box is not a hemisphere.
+        shape = labels[y:y + height, x:x + width] == component
+        band = max(1, height // 4)
+        if shape[:band].mean() >= shape[-band:].mean() * 0.85:
+            continue
+
+        def patch(dx1, dx2, dy1, dy2):
+            x1, x2 = round(center_x + dx1 * width), round(center_x + dx2 * width)
+            y1, y2 = round(bottom_y + dy1 * width), round(bottom_y + dy2 * width)
+            if x1 < 0 or y1 < 0 or x2 > w or y2 > h or x1 >= x2 or y1 >= y2:
+                return None
+            return arr[y1:y2, x1:x2, :3]
+
+        lower = patch(-0.30, 0.30, 0.18, 0.34)
+        center = patch(-0.06, 0.06, -0.04, 0.06)
+        if lower is None or center is None:
+            continue
+        white = (lower.min(axis=2) > 225) & (np.ptp(lower, axis=2) < 30)
+        neutral = ((center.min(axis=2) > 100) & (center.max(axis=2) < 215)
+                   & (np.ptp(center, axis=2) < 55))
+        if white.mean() > 0.85 and neutral.mean() > 0.75:
+            return True
+    return False
 
 
 def _has_storage_header(arr: np.ndarray) -> bool:
@@ -86,13 +119,14 @@ def _has_hp_bar(arr: np.ndarray, sx: float, sy: float) -> bool:
 
 class GameNavigator:
     def __init__(self, adb: ADBController, regions: ScreenRegions,
-                 cancelled=None):
+                 cancelled=None, observation_generation=None):
         self.adb = adb
         self.r = regions
         w, h = regions.screen_width, regions.screen_height
         self.sx = w / 968
         self.sy = h / 2376
         self._cancelled = cancelled or (lambda: False)
+        self._observation_generation = observation_generation or (lambda: 0)
         self._virtual_display = isinstance(getattr(adb, "display_id", None), int)
         if self._virtual_display:
             info = adb.get_device_info()
@@ -301,7 +335,14 @@ class GameNavigator:
         for attempt in range(8):
             if self.is_cancelled():
                 return False
+            generation = self._observation_generation()
             screen = self.detect_screen()
+            if self.is_cancelled():
+                return False
+            if generation != self._observation_generation():
+                # A pause may outlast or replace this screen. Observe again
+                # before using any screen-relative navigation coordinates.
+                continue
             log.info("navigate_to_storage attempt %d: '%s'", attempt + 1, screen)
 
             if screen == 'storage':
@@ -406,25 +447,35 @@ class GameNavigator:
         clipped by the visible field, before applying the filter.
         """
         log.info("Searching: %s", query)
-        if self.is_cancelled():
+        chunked = verify and len(query) > 80
+        if chunked and len(query) > 512:
+            log.warning("Applied search held: query exceeds complete editor readback limit")
+            return False
+        generation = self._observation_generation() if chunked else None
+
+        def invalidated():
+            return self.is_cancelled() or (
+                chunked and generation != self._observation_generation())
+
+        if invalidated():
             return False
         if verify and self.detect_screen() != "storage":
             return False
-        if self.is_cancelled():
+        if invalidated():
             return False
 
         # Step 1: Clear existing filter — tap X button at right end of search bar
         clear_target = self.r.storage_search_clear or self._s(920, 300)
         self.adb.tap(*clear_target, jitter=3)
         human_delay(0.5, 0.1)
-        if self.is_cancelled():
+        if invalidated():
             return False
 
         # Step 2: Tap search bar to open keyboard
         search_target = self.r.storage_search_bar or self._s(*SEARCH_BAR)
         self.adb.tap(*search_target, jitter=3)
         human_delay(1.0, 0.2)
-        if self.is_cancelled():
+        if invalidated():
             return False
 
         # The focused game editor exposes its full value independently of the
@@ -434,7 +485,7 @@ class GameNavigator:
             # cannot prove search context; storage stays visible above the IME.
             if self.detect_screen() != "storage":
                 return False
-            if self.is_cancelled():
+            if invalidated():
                 return False
             from .search_text import read_search_text
             previous = read_search_text(self.adb)
@@ -444,51 +495,89 @@ class GameNavigator:
             clear_length = len(previous)
         else:
             clear_length = 40
-        if self.is_cancelled():
+        if invalidated():
             return False
 
         # Step 3: Clear remaining text (legacy callers retain their old path).
         self.adb.key_event(123)  # MOVE_END
         time.sleep(0.1)
         for _ in range(clear_length):
-            if self.is_cancelled():
+            if invalidated():
                 return False
             self.adb.key_event(67)  # DEL
         time.sleep(0.2)
-        if self.is_cancelled():
+        if invalidated():
             return False
         if verify and read_search_text(self.adb) != "":
             log.warning("Storage search clearing was not confirmed")
             return False
-        if self.is_cancelled():
+        if invalidated():
             return False
 
         # Step 4: Type the new query
         if verify and self.detect_screen() != "storage":
             return False
-        if self.is_cancelled():
+        if invalidated():
             return False
-        if query:
+        if chunked:
+            if not self._type_verified_search_chunks(query, invalidated):
+                return False
+        elif query:
             self.adb.input_text(query)
         human_delay(0.5, 0.2)
-        if self.is_cancelled():
+        if invalidated():
             return False
         if verify and read_search_text(self.adb) != query:
             log.warning("Applied search held: complete query readback did not match")
             return False
-        if self.is_cancelled():
+        if invalidated():
             return False
 
         # Step 5: Apply
         if verify and self.detect_screen() != "storage":
             return False
-        if self.is_cancelled():
+        if invalidated():
             return False
         self.adb.key_event(66)  # ENTER
         human_delay(2.0, 0.5)
-        if self.is_cancelled():
+        if invalidated():
             return False
         return not verify or self.detect_screen() == "storage"
+
+    # TRACEWEAVER: entrypoint=_type_verified_search_chunks; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
+    def _type_verified_search_chunks(self, query, invalidated):
+        """Append bounded chunks only to the independently confirmed prefix.
+
+        A failed read stops immediately; retrying or appending to an uncertain
+        editor could silently change the filter. The caller still owns final
+        full-query readback and ENTER.
+        """
+        from .search_text import read_search_text
+
+        for offset in range(0, len(query), 80):
+            if invalidated() or self.detect_screen() != "storage":
+                return False
+            if invalidated():
+                return False
+            if read_search_text(self.adb) != query[:offset]:
+                log.warning("Applied search held: prefix changed before chunk at %d", offset)
+                return False
+            if invalidated() or self.detect_screen() != "storage":
+                return False
+            if invalidated():
+                return False
+            self.adb.input_text(query[offset:offset + 80])
+            human_delay(0.1, 0.02)
+            if invalidated() or self.detect_screen() != "storage":
+                return False
+            if invalidated():
+                return False
+            if read_search_text(self.adb) != query[:offset + 80]:
+                log.warning("Applied search held: incomplete chunk readback at %d", offset)
+                return False
+            if invalidated():
+                return False
+        return True
 
 # TRACEWEAVER: entrypoint=read_filtered_count; req=REQ-SCAN-003; trace=TRACE-SCAN-006; ver=VER-SCAN-001
     def read_filtered_count(self) -> int:
@@ -584,6 +673,128 @@ class GameNavigator:
 
         log.warning("Could not read filtered count after retries")
         return 0
+
+    # TRACEWEAVER: entrypoint=read_filtered_count_verified; req=REQ-SCAN-003; trace=TRACE-SCAN-006; ver=VER-SCAN-001
+    def read_filtered_count_verified(self) -> int | None:
+        """Confirm a storage count twice; distinguish explicit zero from failure.
+
+        The caller must first apply and verify its search. Each observation
+        validates storage again. Bare OCR zero is ambiguous; only a complete
+        parenthesized or owned/capacity header can prove an empty result.
+        """
+        import math
+        import re
+        import cv2
+        import pytesseract
+
+        def parse(text, *, allow_bare=True):
+            text = text.strip()
+            match = re.fullmatch(r"(?:Q\s*)?\(\s*(\d+)\s*\)", text)
+            if match:
+                value = int(match.group(1))
+                return value if 0 <= value <= 10000 else None
+            match = re.fullmatch(r"(?:Q\s*)?(\d+)\s*/\s*(\d+)", text)
+            if match:
+                value, capacity = map(int, match.groups())
+                return value if 0 <= value <= capacity <= 10000 and capacity > 0 else None
+            if allow_bare and re.fullmatch(r"\d+", text):
+                value = int(text)
+                return value if 1 <= value <= 10000 else None
+            return None
+
+        def independent(older, newer):
+            if older is newer or older.size != newer.size:
+                return False
+            bounds = tuple(image.info.get(key) for image in (older, newer)
+                           for key in ("pokemgr_capture_started_at", "pokemgr_capture_finished_at"))
+            if (not all(type(value) in (int, float) and math.isfinite(value) for value in bounds)
+                    or not (0 < bounds[0] <= bounds[1] < bounds[2] <= bounds[3])):
+                return False
+            keys = ("pokemgr_stream_session", "pokemgr_stream_sequence",
+                    "pokemgr_stream_pts_us", "pokemgr_source_clock_generation")
+            token_key = "pokemgr_source_clock_continuity"
+            if not any(key in image.info for image in (older, newer) for key in (*keys, token_key)):
+                return True
+            first, second = (tuple(image.info.get(key) for key in keys) for image in (older, newer))
+            if (not isinstance(first[0], str) or not first[0] or first[0] != second[0]
+                    or not all(type(value) is int and value > 0 for value in (*first[1:], *second[1:]))
+                    or second[1] <= first[1] or second[2] <= first[2]):
+                return False
+            if any(token_key in image.info for image in (older, newer)):
+                tokens = (older.info.get(token_key), newer.info.get(token_key))
+                return (all(isinstance(token, str) and re.fullmatch(r"[0-9a-f]{32}", token)
+                            for token in tokens)
+                        and tokens[0] == tokens[1] and second[3] >= first[3])
+            return first[3] == second[3]
+
+        previous = None
+        observed = None
+        for attempt in range(4):
+            if self.is_cancelled():
+                return None
+            if attempt:
+                time.sleep(0.3)
+                if self.is_cancelled():
+                    return None
+            try:
+                image = self.adb.screencap()
+            except ADBError as exc:
+                log.warning("Verified count capture unavailable: %s", exc)
+                return None
+            if self.is_cancelled():
+                return None
+            screen = self.detect_screen(image)
+            if self.is_cancelled() or screen != "storage":
+                log.warning("Verified count lost storage context")
+                return None
+            w, h = image.size
+            crop = image.crop((int(300 * w / 968), int(145 * h / 2376),
+                               int(670 * w / 968), int(195 * h / 2376)))
+            try:
+                gray = cv2.cvtColor(np.asarray(crop.convert("RGB")), cv2.COLOR_RGB2GRAY)
+                gray = cv2.resize(gray, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
+                _, binary = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY_INV)
+                text = pytesseract.image_to_string(
+                    binary, config="--psm 7 -c tessedit_char_whitelist=0123456789()Q/",
+                ).strip()
+            except (pytesseract.TesseractError, OSError, ValueError, cv2.error) as exc:
+                log.warning("Verified count OCR unavailable: %s", exc)
+                return None
+            if self.is_cancelled():
+                return None
+            count = parse(text)
+            if count is None:
+                # Inverted text can lose the thin owned/capacity slash. Retain
+                # its lighter edge pixels in normal polarity, without repair.
+                try:
+                    _, binary = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
+                    text = pytesseract.image_to_string(
+                        binary, config="--psm 7 -c tessedit_char_whitelist=0123456789()Q/",
+                    ).strip()
+                except (pytesseract.TesseractError, OSError, ValueError, cv2.error) as exc:
+                    log.warning("Verified count fallback OCR unavailable: %s", exc)
+                    return None
+                if self.is_cancelled():
+                    return None
+                # A lone number could be only the capacity half. The retry
+                # must recover a complete header, not merely readable digits.
+                count = parse(text, allow_bare=False)
+            if count is None:
+                previous = None
+                continue
+            if observed is not None and count != observed:
+                log.warning("Verified count disagreed: %d then %d", observed, count)
+                return None
+            observed = count
+            if previous is not None:
+                if not independent(previous, image):
+                    log.warning("Verified count captures were not independent")
+                    return None
+                log.info("Verified filtered count: %d (text='%s')", count, text)
+                return count
+            previous = image
+        log.warning("Could not independently confirm the filtered count")
+        return None
 
     def ensure_pokemon_go(self, restart: bool = False) -> bool:
         if self.is_cancelled():

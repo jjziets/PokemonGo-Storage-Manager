@@ -11,6 +11,7 @@ import time
 import logging
 import uuid
 import random
+import math
 from typing import Callable
 
 from ..adb.controller import ADBController, StreamCaptureInvalidated
@@ -43,6 +44,17 @@ class _UnresolvedAppraisalName(RuntimeError):
 
 class _AppraisalConfirmationInvalidated(RuntimeError):
     """A pause discarded the read-only confirmation before any recovery input."""
+
+
+class _PreInputIVConflict(RuntimeError):
+    """Only an IV read changed before any CP recovery input was sent."""
+
+    def __init__(self, before, frame, anchor, pause_generation):
+        super().__init__("CP recovery appraisal identity changed before closing: IV reads disagree")
+        self.frame = frame
+        self.discarded_frames = (before, frame)
+        self.anchor = anchor
+        self.pause_generation = pause_generation
 
 
 class IndexingStateMachine:
@@ -88,6 +100,8 @@ class IndexingStateMachine:
         self.use_calculated_cp = config.calculated_cp_recovery_enabled()
         self.use_cp_animation = config.cp_animation_recovery_enabled()
         self._last_stable_image = None
+        self._last_accepted_image = None
+        self._last_accepted_pause_generation = None
         self._last_validated_identity_key: tuple | None = None
         self._previous_validated_identity_key: tuple | None = None
         self._transition_required = False
@@ -226,6 +240,7 @@ class IndexingStateMachine:
                         self.visited_count % BATTERY_CHECK_INTERVAL == 0):
                     self._check_battery()
 
+                accepted_generation = self._pause_generation
                 decision, frame, failure_kind, reason = (
                     self._acquire_validated_snapshot(
                         previous_accepted=self._last_stable_image,
@@ -238,6 +253,7 @@ class IndexingStateMachine:
                     continue
                 self._transition_required = False
                 if decision is None and failure_kind == "transition_returned_to_previous":
+                    accepted_generation = self._pause_generation
                     decision, frame, failure_kind, reason = (
                         self._recover_failed_transition(frame)
                     )
@@ -272,6 +288,8 @@ class IndexingStateMachine:
                     # against an older Pokemon and skip over the ambiguity.
                     self._last_validated_identity_key = None
                     self._previous_validated_identity_key = None
+                    self._last_accepted_image = None
+                    self._last_accepted_pause_generation = None
                     message = (
                         f"Skipped position {self.visited_count}: {reason}; "
                         "favorited for review"
@@ -290,11 +308,13 @@ class IndexingStateMachine:
 
                     # Unfavorite applies only to accepted rows when explicitly
                     # enabled. Unresolved rows keep their review favorite.
+                    unfavorite_verified = False
                     if self.unfavorite_all and snapshot.favorited:
-                        if not self._safe_tap(
-                                *self.regions.favorite_star_region.center):
+                        decision, frame = self._unfavorite_accepted_snapshot(decision, frame)
+                        if decision is None:
                             break
-                        human_delay(0.15, 0.1)
+                        snapshot = decision.snapshot
+                        unfavorite_verified = True
 
                     detail = snapshot.as_detail()
                     appraisal = snapshot.as_appraisal()
@@ -303,6 +323,10 @@ class IndexingStateMachine:
                         appraisal,
                         position=resume_offset + self.visited_count,
                     )
+                    if unfavorite_verified:
+                        # Persist a confirmed star change before navigating,
+                        # even when the normal scan batch is not yet full.
+                        self.db.flush()
                     # A visible CP can be accepted even when HP was unreadable,
                     # but an incomplete tuple must never authorize the raw-
                     # identity fallback for the next carousel position.
@@ -312,6 +336,11 @@ class IndexingStateMachine:
                     )
                     self.visited_count += 1
                     self._last_stable_image = frame
+                    self._last_accepted_image = (
+                        frame if not self._paused and self._pause_generation == accepted_generation
+                        else None
+                    )
+                    self._last_accepted_pause_generation = accepted_generation
                     self.consecutive_failures = 0
                     log.info(
                         "Accepted %s CP%d from %s evidence at L%s",
@@ -398,6 +427,8 @@ class IndexingStateMachine:
         last_reason = "snapshot did not validate"
         transition_pending = require_transition
         cp_recovery_attempted = False
+        iv_reacquisition = None
+        iv_pair_pending = False
 
         for attempt in range(3):
             self._settled_frame_pair = None
@@ -411,9 +442,18 @@ class IndexingStateMachine:
                 allow_structured_fallback=transition_pending,
             )
             settled_pair = self._settled_frame_pair
+            acquisition_frames = settled_pair if isinstance(settled_pair, tuple) else (frame,)
+            transition_pair = settled_pair
             self._settled_frame_pair = None
             if frame is None:
                 return None, last_frame, status, status.replace("_", " ")
+            if iv_reacquisition is not None:
+                if self._abort:
+                    return None, frame, "aborted", "abort requested"
+                if (self._paused or self._pause_generation != iv_reacquisition.pause_generation):
+                    return None, None, "reacquire", "pause invalidated IV reacquisition"
+                if status != "stable":
+                    return None, frame, "cp_recovery_failed", "IV reacquisition could not confirm the witnessed position"
             transition_pending = False
             last_frame = frame
 
@@ -421,32 +461,115 @@ class IndexingStateMachine:
             if self._abort:
                 return None, frame, "aborted", "abort requested"
             snapshot = AppraisalSnapshot.from_reads(detail, appraisal)
+            renewed_confirmation = None
+            if iv_reacquisition is not None:
+                # A conflicting pair is discarded in full. Neither image may
+                # count toward the replacement proof, even if its IVs recur.
+                if (not isinstance(settled_pair, tuple) or len(settled_pair) != 2
+                        or settled_pair[1] is not frame
+                        or settled_pair[0] is frame
+                        or any(image is discarded for image in settled_pair
+                               for discarded in iv_reacquisition.discarded_frames)
+                        or not self._specimen_frame_sources_ordered(iv_reacquisition.frame, settled_pair[0])
+                        or not self._independent_frame_sources(*settled_pair)
+                        or not appraisal_frames_stable(*settled_pair)):
+                    return None, frame, "cp_recovery_failed", "IV reacquisition needs two new independent settled frames"
+                capture_bounds = tuple(image.info.get(key)
+                                       for image in (iv_reacquisition.frame, *settled_pair)
+                                       for key in ("pokemgr_capture_started_at", "pokemgr_capture_finished_at"))
+                if (not all(type(value) in (int, float) and math.isfinite(value)
+                            for value in capture_bounds)
+                        or not (0 < capture_bounds[0] <= capture_bounds[1] < capture_bounds[2]
+                                <= capture_bounds[3] < capture_bounds[4] <= capture_bounds[5])):
+                    return None, frame, "cp_recovery_failed", "IV reacquisition capture times are not independently fresh"
+                older = settled_pair[0]
+                if (self.nav.detect_screen(older) != "appraisal"
+                        or not self.reader.are_bars_visible(older)
+                        or self.nav.detect_screen(frame) != "appraisal"
+                        or not self.reader.are_bars_visible(frame)):
+                    return None, frame, "cp_recovery_failed", "IV reacquisition lost appraisal"
+                older_detail, older_appraisal = self._read_appraisal_snapshot(older)
+                if self._abort:
+                    return None, frame, "aborted", "abort requested"
+                if (self._paused or self._pause_generation != iv_reacquisition.pause_generation):
+                    return None, None, "reacquire", "pause invalidated IV reacquisition"
+                renewed_confirmation = AppraisalSnapshot.from_reads(older_detail, older_appraisal)
+                if any(self._non_iv_recovery_identity(read) != iv_reacquisition.anchor
+                       for read in (snapshot, renewed_confirmation)):
+                    return None, frame, "cp_recovery_failed", "IV reacquisition changed or lost non-IV identity"
+                if self._cp_recovery_identity(snapshot) != self._cp_recovery_identity(renewed_confirmation):
+                    iv_reacquisition.discarded_frames += settled_pair
+                    iv_reacquisition.frame = frame
+                    iv_pair_pending = True
+                    transition_pending = require_transition
+                    cp_recovery_attempted = False
+                    last_reason = "IV reads still disagree after bounded reacquisition"
+                    log.info("IV reacquisition pair disagreed (%d/3); discarding both reads", attempt + 1)
+                    continue
+                iv_pair_pending = False
             decision = self._validate_appraisal_snapshot(snapshot, frame)
             if self._abort:
                 return None, frame, "aborted", "abort requested"
             recovery_identity = self._cp_recovery_identity(snapshot)
-            calculated_pair_confirmed = self._calculated_cp_confirmed_by_pair(
-                snapshot, decision, frame, settled_pair, pair_pause_generation,
-            )
+            force_confirmation = False
+            if renewed_confirmation is not None:
+                renewed_decision = self._validate_appraisal_snapshot(renewed_confirmation, settled_pair[0])
+                if self._abort:
+                    return None, frame, "aborted", "abort requested"
+                if (self._paused or self._pause_generation != iv_reacquisition.pause_generation):
+                    return None, None, "reacquire", "pause invalidated IV reacquisition"
+                both_exact = decision.accepted and renewed_decision.accepted
+                if (both_exact and self._complete_identity_key(decision.snapshot)
+                        != self._complete_identity_key(renewed_decision.snapshot)):
+                    return None, frame, "cp_recovery_failed", "IV reacquisition has conflicting exact CP results"
+                calculated_pair_confirmed = bool(both_exact)
+                force_confirmation = decision.accepted and not renewed_decision.accepted
+            else:
+                calculated_pair_confirmed = self._calculated_cp_confirmed_by_pair(
+                    snapshot, decision, frame, settled_pair, pair_pause_generation,
+                )
             # The pair is local to this acquisition and never survives recovery
             # input or a retry. Only its completed independent proof is retained.
             settled_pair = None
             if self._abort:
                 return None, frame, "aborted", "abort requested"
+            if force_confirmation and cp_recovery_attempted:
+                return None, frame, "cp_recovery_failed", "IV reacquisition did not independently confirm CP"
             if (
                 not cp_recovery_attempted
                 and not calculated_pair_confirmed
                 and recovery_identity is not None
                 and (not decision.accepted
-                     or decision.cp_source.startswith("calculated"))
+                     or decision.cp_source.startswith("calculated")
+                     or force_confirmation)
             ):
                 cp_recovery_attempted = True
+                # Recovery may move through detail/preview screens. Its old
+                # settled pair cannot prove the subsequent carousel position.
+                transition_pair = None
                 try:
                     decision, frame = self._recover_cp_with_model_taps(
                         snapshot, frame, save_failure_evidence=save_failure_evidence,
                     )
                 except _AppraisalConfirmationInvalidated as exc:
                     return None, None, "reacquire", str(exc)
+                except _PreInputIVConflict as exc:
+                    if (self._paused or self._pause_generation != pair_pause_generation):
+                        return None, None, "reacquire", "pause invalidated IV reacquisition"
+                    # An unobserved carousel move must not become a witnessed
+                    # position merely because another read was requested.
+                    if status != "stable":
+                        return None, exc.frame, "cp_recovery_failed", str(exc)
+                    discarded = iv_reacquisition.discarded_frames if iv_reacquisition is not None else ()
+                    exc.discarded_frames += (*discarded, *acquisition_frames)
+                    iv_reacquisition = exc
+                    iv_pair_pending = True
+                    cp_recovery_attempted = False
+                    transition_pending = require_transition
+                    last_frame = exc.frame
+                    last_reason = "IV reads still disagree after bounded reacquisition"
+                    log.info("IVs changed before recovery input; discarding the acquisition (%d/3)", attempt + 1)
+                    continue
                 except _UnresolvedAppraisalName as exc:
                     # Only a witnessed transition (or the initial position)
                     # permits skipping. A name reread cannot prove that an
@@ -461,6 +584,9 @@ class IndexingStateMachine:
                 last_frame = frame
                 if self._abort or decision is None:
                     return None, frame, "aborted", "abort requested"
+                if (iv_reacquisition is not None
+                        and (self._paused or self._pause_generation != iv_reacquisition.pause_generation)):
+                    return None, None, "reacquire", "pause invalidated IV reacquisition"
             log.info(
                 "Snapshot %d/3: %s CP%d %d/%d/%d HP%d caught='%s' -> %s",
                 attempt + 1,
@@ -504,14 +630,39 @@ class IndexingStateMachine:
                         "transition has no complete prior validated tuple",
                     )
 
+                if (current_key == previous_key and transition_pair is not None
+                        and transition_pair[-1] is frame):
+                    # Repeated specimen details can prove the move even when
+                    # every captured frame arrived after the animation ended.
+                    if self._same_stats_specimen_advanced(
+                        previous_accepted, transition_pair, current_key,
+                        pair_pause_generation,
+                    ):
+                        return decision, frame, "ok", "same stats; distinct specimen details confirmed"
+                    if self._abort:
+                        return None, frame, "aborted", "abort requested"
+                    if self._paused or self._pause_generation != pair_pause_generation:
+                        return None, None, "reacquire", "pause invalidated specimen confirmation"
+
                 # ADB screencap can take long enough that the carousel animation
                 # has already finished before the first post-swipe frame arrives.
                 # In that case the broad pixel ROIs never witness motion even
                 # though the phone has advanced.  Confirm the new identity from
                 # a second settled immutable frame before trusting structured
                 # evidence without an observed animation.
+                transition_pair_confirmed = calculated_pair_confirmed
                 if (status == "stable_transition_unobserved"
-                        and not calculated_pair_confirmed):
+                        and not transition_pair_confirmed
+                        and current_key != previous_key):
+                    transition_pair_confirmed = self._visible_cp_confirmed_by_pair(
+                        decision, frame, transition_pair, pair_pause_generation,
+                    )
+                    if self._abort:
+                        return None, frame, "aborted", "abort requested"
+                    if self._paused or self._pause_generation != pair_pause_generation:
+                        return None, None, "reacquire", "pause invalidated transition confirmation"
+                if (status == "stable_transition_unobserved"
+                        and not transition_pair_confirmed):
                     human_delay(0.2, 0.2)
                     if self._abort:
                         return None, frame, "aborted", "abort requested"
@@ -626,6 +777,10 @@ class IndexingStateMachine:
                     current_key = confirmation_key
 
                 if current_key == previous_key:
+                    if self._abort:
+                        return None, frame, "aborted", "abort requested"
+                    if self._paused or self._pause_generation != pair_pause_generation:
+                        return None, None, "reacquire", "pause invalidated specimen confirmation"
                     return (
                         None,
                         frame,
@@ -647,6 +802,8 @@ class IndexingStateMachine:
 
         if save_failure_evidence:
             self._save_failed_appraisal(last_frame, last_reason)
+        if iv_pair_pending:
+            return None, last_frame, "cp_recovery_failed", last_reason
         return None, last_frame, "invalid", last_reason
 
     @staticmethod
@@ -663,6 +820,175 @@ class IndexingStateMachine:
                         for value in (*first[1:], *second[1:]))
                 and first[3] == second[3]
                 and second[1] > first[1] and second[2] > first[2])
+
+    @staticmethod
+    def _specimen_frame_sources_ordered(older, newest):
+        """Link independently fresh captures across compatible clock refreshes.
+
+        A refresh changes the mapping revision, but not its validated clock
+        continuity. Reconnects, invalidations and expired coverage change that
+        token. Old captures without tokens retain the strict revision rule.
+        """
+        token_key = "pokemgr_source_clock_continuity"
+        tokens = (older.info.get(token_key), newest.info.get(token_key))
+        if not any(token_key in image.info for image in (older, newest)):
+            return IndexingStateMachine._independent_frame_sources(older, newest)
+        if (not all(isinstance(token, str) and len(token) == 32
+                    and all(char in "0123456789abcdef" for char in token)
+                    for token in tokens) or tokens[0] != tokens[1]):
+            return False
+        keys = ("pokemgr_stream_session", "pokemgr_stream_sequence",
+                "pokemgr_stream_pts_us", "pokemgr_source_clock_generation")
+        first = tuple(older.info.get(key) for key in keys)
+        second = tuple(newest.info.get(key) for key in keys)
+        if (not isinstance(first[0], str) or not first[0] or first[0] != second[0]
+                or not all(type(value) is int and value > 0
+                           for value in (*first[1:], *second[1:]))
+                or second[1] <= first[1] or second[2] <= first[2]
+                or second[3] < first[3]):
+            return False
+        times = tuple(image.info.get(key) for image in (older, newest)
+                      for key in ("pokemgr_capture_started_at", "pokemgr_capture_finished_at"))
+        return (all(type(value) in (int, float) and math.isfinite(value) for value in times)
+                and 0 < times[0] <= times[1] < times[2] <= times[3])
+
+    # TRACEWEAVER: entrypoint=_same_stats_specimen_advanced; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+    @timing.timed("scan.specimen_confirmation")
+    def _same_stats_specimen_advanced(self, previous_accepted, current_pair,
+                                      key, pause_generation):
+        """Prove a same-stat neighbour using repeated, frame-local details.
+
+        Two independent settled captures on each side of the swipe must agree
+        on the complete battle tuple. A confident weight, height, sex or catch date
+        must agree within each side and differ across it. This proof neither
+        issues input nor changes position/history; missing details fail closed.
+        """
+        from .snapshot import AppraisalSnapshot, appraisal_frames_stable
+
+        def interrupted():
+            return (self._abort or self._paused
+                    or self._pause_generation != pause_generation)
+
+        def rejected(reason):
+            log.info("Same-stat specimen confirmation unavailable: %s", reason)
+            return False
+
+        if (interrupted() or key is None
+                or key != self._last_validated_identity_key
+                or self._last_accepted_pause_generation != pause_generation
+                or not isinstance(current_pair, tuple) or len(current_pair) != 2):
+            return rejected("accepted reference or pause generation unavailable")
+        frames = (self._last_accepted_image, previous_accepted, *current_pair)
+        if (any(image is None for image in frames)
+                or len({id(image) for image in frames}) != 4
+                or len({image.size for image in frames}) != 1):
+            return rejected("four distinct same-size captures unavailable")
+        stream_keys = ("pokemgr_stream_session", "pokemgr_stream_sequence",
+                       "pokemgr_stream_pts_us", "pokemgr_source_clock_generation")
+        if any(name in image.info for image in frames
+               for name in (*stream_keys, "pokemgr_source_clock_continuity")):
+            if not all(self._specimen_frame_sources_ordered(a, b)
+                       for a, b in zip(frames, frames[1:])):
+                log.info("Specimen source evidence: %s", [
+                    tuple(image.info.get(name) for name in (*stream_keys,
+                        "pokemgr_source_clock_continuity", "pokemgr_capture_started_at",
+                        "pokemgr_capture_finished_at")) for image in frames
+                ])
+                return rejected("capture chronology or clock continuity did not agree")
+        else:
+            # Bare images and Pillow copies have no independent-capture proof.
+            previous_finish = float("-inf")
+            for image in frames:
+                start = image.info.get("pokemgr_capture_started_at")
+                finish = image.info.get("pokemgr_capture_finished_at")
+                if (type(start) not in (int, float) or type(finish) not in (int, float)
+                        or not math.isfinite(start) or not math.isfinite(finish)
+                        or start <= previous_finish or finish < start):
+                    return rejected("legacy capture times were missing or unordered")
+                previous_finish = finish
+        if (not appraisal_frames_stable(*frames[:2])
+                or not appraisal_frames_stable(*frames[2:])):
+            return rejected("before/after appraisal frames did not stay settled")
+        markers = []
+        for image in frames:
+            if (interrupted() or self.nav.detect_screen(image) != "appraisal"
+                    or not self.reader.are_bars_visible(image)):
+                return rejected("appraisal screen or visible bars unavailable")
+            detail, appraisal = self._read_appraisal_snapshot(image)
+            if interrupted():
+                return rejected("pause or abort during appraisal read")
+            decision = self._validate_appraisal_snapshot(
+                AppraisalSnapshot.from_reads(detail, appraisal), image,
+            )
+            if (interrupted() or not decision.accepted or decision.snapshot is None
+                    or self._complete_identity_key(decision.snapshot) != key):
+                return rejected("one frame did not validate the complete matching tuple")
+            values = self.reader.specimen_markers(image)
+            if interrupted():
+                return rejected("pause or abort during specimen text read")
+            gender = self.reader.specimen_gender(image)
+            if interrupted():
+                return rejected("pause or abort during sex read")
+            markers.append((*values, gender if gender in ("male", "female") else ""))
+        for name, values in zip(("weight", "height", "caught date", "sex"), zip(*markers)):
+            before, before_repeat, after, after_repeat = values
+            if before and after and before == before_repeat and after == after_repeat and before != after:
+                log.info("Same-stat neighbour confirmed by repeated %s: %s -> %s",
+                         name, before, after)
+                return True
+        log.info("Specimen details before/after: %s", markers)
+        return rejected("no confident repeated detail changed")
+
+    @timing.timed("scan.visible_pair_confirmation")
+    def _visible_cp_confirmed_by_pair(self, decision, frame,
+                                      settled_pair, pause_generation):
+        """Reuse an independent settled image to confirm an exact new tuple.
+
+        The pair belongs to this acquisition and is discarded by any recovery
+        input. Missing or conflicting evidence retains the fresh third-frame
+        confirmation; this read-only shortcut never proves same-stat movement.
+        """
+        from .snapshot import AppraisalSnapshot, appraisal_frames_stable
+
+        def interrupted():
+            return (self._abort or self._paused
+                    or self._pause_generation != pause_generation)
+
+        if (interrupted() or not decision.accepted or decision.snapshot is None
+                or decision.cp_source not in {"screen", "screen_alternate_ocr"}
+                or not isinstance(settled_pair, tuple) or len(settled_pair) != 2):
+            return False
+        older, newest = settled_pair
+        key = self._complete_identity_key(decision.snapshot)
+        if (key is None or newest is not frame or older is None or older is newest
+                or older.size != newest.size
+                or not self._independent_frame_sources(older, newest)):
+            return False
+        # Capture times also exclude bare images and Pillow copies on legacy
+        # capture paths, where no source sequence is available.
+        bounds = tuple(image.info.get(name) for image in settled_pair
+                       for name in ("pokemgr_capture_started_at", "pokemgr_capture_finished_at"))
+        if (not all(type(value) in (int, float) and math.isfinite(value) for value in bounds)
+                or not (0 < bounds[0] <= bounds[1] < bounds[2] <= bounds[3])):
+            return False
+        for image in settled_pair:
+            if (interrupted() or self.nav.detect_screen(image) != "appraisal"
+                    or not self.reader.are_bars_visible(image)):
+                return False
+        if (interrupted() or not appraisal_frames_stable(older, newest)
+                or not self.reader.appraisal_bars_stable(older, newest)):
+            return False
+        if interrupted():
+            return False
+        detail, appraisal = self._read_appraisal_snapshot(older)
+        if interrupted():
+            return False
+        confirmation = self._validate_appraisal_snapshot(
+            AppraisalSnapshot.from_reads(detail, appraisal), older,
+        )
+        return (not interrupted() and confirmation.accepted
+                and confirmation.snapshot is not None
+                and self._complete_identity_key(confirmation.snapshot) == key)
 
     @timing.timed("scan.pair_confirmation")
     def _calculated_cp_confirmed_by_pair(self, snapshot, decision, frame,
@@ -715,6 +1041,8 @@ class IndexingStateMachine:
         from ..pvp.resolver import resolve_candidates
 
         primary = validate_snapshot(snapshot, self.use_calculated_cp)
+        if snapshot.in_gym:
+            return primary
         # Unique HP/IV calculations are confirmed from a separate fresh frame
         # by the acquisition loop; alternate OCR adds no evidence they need.
         if primary.accepted:
@@ -786,7 +1114,8 @@ class IndexingStateMachine:
             )
         return primary
 
-    def _save_failed_appraisal(self, frame, reason, phase="appraisal"):
+    # TRACEWEAVER: entrypoint=_save_failed_appraisal; req=REQ-MASS-001,REQ-SCAN-003; trace=TRACE-MASS-001,TRACE-SCAN-003; ver=VER-SCAN-001
+    def _save_failed_appraisal(self, frame, reason, phase="appraisal", *, position=None):
         """Keep the actual skipped pixels so the failure can be reproduced."""
         if frame is None:
             return
@@ -794,7 +1123,8 @@ class IndexingStateMachine:
         try:
             destination = config.CACHE_DIR / "scan_failures" / self.session_id
             destination.mkdir(parents=True, exist_ok=True)
-            position = max(0, int(self.skip_first_n)) + self.visited_count + 1
+            if position is None:
+                position = max(0, int(self.skip_first_n)) + self.visited_count + 1
             prefix = destination / f"position_{position:05d}"
             frame.save(f"{prefix}_{phase}.png")
             frame.crop(self.regions.cp_region.as_tuple()).save(f"{prefix}_cp.png")
@@ -809,7 +1139,8 @@ class IndexingStateMachine:
     def _cp_recovery_identity(snapshot) -> tuple | None:
         """Complete non-CP evidence required for a temporary detail visit."""
         if (
-            not snapshot.read_complete
+            snapshot.in_gym
+            or not snapshot.read_complete
             or not snapshot.detected_species.strip()
             or not (snapshot.caught_species.strip() or snapshot.candy_family.strip())
             or not snapshot.display_name.strip()
@@ -825,16 +1156,60 @@ class IndexingStateMachine:
             *snapshot.ivs,
         )
 
+    @staticmethod
+    def _non_iv_recovery_identity(snapshot) -> tuple | None:
+        """Fixed complete evidence around an IV-only pre-input disagreement."""
+        identity = IndexingStateMachine._cp_recovery_identity(snapshot)
+        if identity is None:
+            return None
+        return (*identity[:4], snapshot.cp, snapshot.gender, snapshot.shiny,
+                snapshot.shadow, snapshot.favorited, snapshot.lucky, snapshot.is_dynamax,
+                snapshot.weight_tag, snapshot.height_tag, snapshot.candy_family)
+
+    def _review_caught_name_drift(self, original, current, before, after, *, allow_exact=False):
+        """Match quote-only caught-name uncertainty for review, never CP.
+
+        Keep letters, gender symbols and form words intact. This recognizes
+        the same anchored text without assigning either spelling to a species.
+        """
+        import unicodedata
+        from .snapshot import appraisal_frames_stable
+
+        if (self._cp_recovery_identity(original) is None
+                or self._cp_recovery_identity(current) is None
+                or not original.caught_species.strip() or not current.caught_species.strip()
+                or original.detected_species != original.caught_species
+                or current.detected_species != current.caught_species
+                or original.display_name != current.display_name
+                or (original.hp, original.ivs) != (current.hp, current.ivs)
+                or any(getattr(original, field) != getattr(current, field)
+                       for field in ("gender", "shiny", "shadow", "lucky",
+                                     "is_dynamax", "candy_family"))
+                or (not allow_exact and original.caught_species == current.caught_species)
+                or before is after):
+            return False
+
+        def anchor(name):
+            name = unicodedata.normalize("NFC", name).casefold()
+            return " ".join(name.split()).rstrip("'\u2018\u2019\"\u201c\u201d").rstrip()
+
+        first, second = anchor(original.caught_species), anchor(current.caught_species)
+        return (len(first) >= 3 and first == second
+                and appraisal_frames_stable(before, after))
+
     def _review_name_drift(self, original, current, before, after):
-        """Allow a small default-name OCR wobble only for favorite-and-skip.
+        """Allow bounded name OCR drift only for favorite-and-skip.
 
         This never authorizes calculated CP or associates a detail CP with an
         appraisal. All other identity fields and the static pixels must agree.
-        Arbitrary nicknames, changed stats, and moving screens stay strict.
+        Display-name drift still requires a default name; changed stats and
+        moving screens stay strict.
         """
         from difflib import SequenceMatcher
         from .snapshot import appraisal_frames_stable
 
+        if self._review_caught_name_drift(original, current, before, after):
+            return True
         first = self._cp_recovery_identity(original)
         second = self._cp_recovery_identity(current)
         if (first is None or second is None or first == second
@@ -847,6 +1222,19 @@ class IndexingStateMachine:
                     or SequenceMatcher(None, name, family).ratio() < 0.8):
                 return False
         return appraisal_frames_stable(before, after)
+
+    def _review_identity(self, snapshot):
+        """A gym review can preserve a star without inventing hidden HP/CP."""
+        if snapshot.in_gym:
+            if (snapshot.in_gym is not True
+                    or not snapshot.read_complete or not snapshot.display_name.strip()
+                    or not snapshot.caught_species.strip()
+                    or snapshot.detected_species != snapshot.caught_species
+                    or any(iv < 0 or iv > 15 for iv in snapshot.ivs)):
+                return None
+            return ("gym", snapshot.detected_species, snapshot.caught_species,
+                    snapshot.display_name, *snapshot.ivs)
+        return self._cp_recovery_identity(snapshot)
 
     def _record_recovery_identity_change(self, original, current, before, after,
                                          *, save_evidence):
@@ -861,24 +1249,127 @@ class IndexingStateMachine:
             self._save_failed_appraisal(before, reason, phase="recovery_before")
             self._save_failed_appraisal(after, reason, phase="recovery_reread")
 
+    @timing.timed("scan.unfavorite", scan=True)
+    def _unfavorite_accepted_snapshot(self, decision, frame):
+        """Confirm one optional star removal before storing its OFF state."""
+        from dataclasses import replace
+        from .snapshot import AppraisalSnapshot, appraisal_frames_stable
+        from ..reader.icons import favorite_state
+
+        original = decision.snapshot
+        expected_key = self._complete_identity_key(original)
+        if expected_key is None:
+            raise RuntimeError("Could not unfavorite scanned Pokemon: complete identity is required")
+        reference = frame
+
+        def observe():
+            nonlocal frame
+            while self._paused and not self._abort:
+                with timing.span("wait.pause", session_id=self.session_id):
+                    time.sleep(.25)
+            if self._abort:
+                return None
+            generation = self._pause_generation
+
+            def interrupted():
+                return self._abort or self._paused or self._pause_generation != generation
+
+            frame = self._fast_screencap()
+            if interrupted():
+                return None
+            if (self.nav.detect_screen(frame) != "appraisal"
+                    or not self.reader.are_bars_visible(frame)):
+                if interrupted():
+                    return None
+                raise RuntimeError("Could not unfavorite scanned Pokemon: appraisal not confirmed")
+            if interrupted():
+                return None
+            detail, appraisal = self._read_appraisal_snapshot(frame)
+            if interrupted():
+                return None
+            current = self._validate_appraisal_snapshot(
+                AppraisalSnapshot.from_reads(detail, appraisal), frame,
+            )
+            if interrupted():
+                return None
+            fields = ("display_name", "caught_species", "gender", "shiny", "shadow", "lucky", "is_dynamax")
+            if (not current.accepted or current.snapshot is None
+                    or self._complete_identity_key(current.snapshot) != expected_key
+                    or any(getattr(current.snapshot, name) != getattr(original, name) for name in fields)
+                    or not appraisal_frames_stable(reference, frame)
+                    or not self.reader.appraisal_bars_stable(reference, frame)):
+                if interrupted():
+                    return None
+                raise RuntimeError("Could not unfavorite scanned Pokemon: identity changed or was unreadable")
+            state = favorite_state(frame, self.regions.favorite_star_region)
+            return None if interrupted() else (state, generation)
+
+        def confirmed_off():
+            return replace(decision, snapshot=replace(original, favorited=False)), frame
+
+        for attempt in range(3):
+            if attempt:
+                human_delay(.1, 0)
+            observed = observe()
+            if self._abort:
+                return None, frame
+            if observed is None:
+                continue
+            state, generation = observed
+            if state == "off":
+                return confirmed_off()
+            if state == "on":
+                if self._paused or self._pause_generation != generation:
+                    continue
+                if not self._safe_tap(*self.regions.favorite_star_region.center, jitter=0):
+                    return None, frame
+                break
+        else:
+            raise RuntimeError("Could not unfavorite scanned Pokemon: star was not confirmed before input")
+
+        # Input may already have reached the game. Remain in readback even
+        # after pause/resume; uncertain or unchanged state must never retap.
+        for attempt in range(3):
+            if attempt or getattr(self.adb, "has_stream_frames", False) is not True:
+                human_delay(.1, 0)
+            observed = observe()
+            if self._abort:
+                return None, frame
+            if observed is not None and observed[0] == "off":
+                log.info("Removed scanned Pokemon favorite; OFF verified before saving")
+                return confirmed_off()
+        raise RuntimeError("Could not confirm unfavorite after one tap; Pokemon was not saved")
+
     @timing.timed("recovery.favorite")
     def _favorite_unresolved_snapshot(self, frame):
         """Set the review favorite once and verify it on the same appraisal."""
-        from .snapshot import AppraisalSnapshot
+        from .snapshot import AppraisalSnapshot, appraisal_frames_stable
         from ..reader.icons import favorite_state
 
         if self._abort:
             return None
+        generation = self._pause_generation
+        caught_review_only = frame.info.get("pokemgr_review_caught_name_drift") is True
 
-        def read_snapshot(image):
-            if (self.nav.detect_screen(image) != "appraisal"
-                    or not self.reader.are_bars_visible(image)):
+        def check_review_generation(snapshot):
+            if ((snapshot.in_gym or caught_review_only)
+                    and (self._paused or self._pause_generation != generation)):
+                raise _AppraisalConfirmationInvalidated("pause invalidated favorite review")
+
+        def read_snapshot(image, *, guard_pause=False):
+            is_appraisal = self.nav.detect_screen(image) == "appraisal"
+            bars_visible = is_appraisal and self.reader.are_bars_visible(image)
+            if guard_pause:
+                check_review_generation(original)
+            if not bars_visible:
                 raise RuntimeError("Could not favorite unresolved Pokemon: appraisal not confirmed")
             detail, appraisal = self._read_appraisal_snapshot(image)
             if self._abort:
                 return None
+            if guard_pause:
+                check_review_generation(original)
             snapshot = AppraisalSnapshot.from_reads(detail, appraisal)
-            if self._cp_recovery_identity(snapshot) is None:
+            if self._review_identity(snapshot) is None:
                 raise RuntimeError("Could not favorite unresolved Pokemon: incomplete identity")
             return snapshot
 
@@ -888,31 +1379,66 @@ class IndexingStateMachine:
             return None
 
         def read_current():
+            nonlocal generation, caught_review_only
+            if original.in_gym or caught_review_only:
+                while self._paused and not self._abort:
+                    with timing.span("wait.pause", session_id=self.session_id):
+                        time.sleep(0.25)
+                if self._abort:
+                    return None, None
+                generation = self._pause_generation
             image = self._fast_screencap()
             if self._abort:
                 return image, None
-            current = read_snapshot(image)
+            check_review_generation(original)
+            current = read_snapshot(image, guard_pause=True)
             if self._abort:
                 return image, None
-            if (self._cp_recovery_identity(current) != self._cp_recovery_identity(original)
-                    and not self._review_name_drift(original, current, original_frame, image)):
+            check_review_generation(original)
+            if original.in_gym or current.in_gym:
+                matches = (self._review_identity(current) == self._review_identity(original)
+                           and appraisal_frames_stable(original_frame, image))
+            else:
+                caught_drift = self._review_caught_name_drift(
+                    original, current, original_frame, image,
+                    allow_exact=caught_review_only,
+                )
+                if caught_review_only:
+                    matches = caught_drift
+                else:
+                    matches = (caught_drift
+                               or self._review_identity(current) == self._review_identity(original)
+                               or self._review_name_drift(original, current, original_frame, image))
+                caught_review_only = caught_review_only or caught_drift
+            check_review_generation(original)
+            if not matches:
                 if self._abort:
                     return image, None
                 raise RuntimeError("Could not favorite unresolved Pokemon: identity changed")
             if self._abort:
                 return image, None
             state = favorite_state(image, self.regions.favorite_star_region)
+            check_review_generation(original)
             return image, state
 
         for attempt in range(3):
-            frame, state = read_current()
-            if self._abort:
-                return None
-            if state == "on":
-                log.info("Unresolved Pokemon is already favorited for review")
-                return frame
-            if state == "off":
-                break
+            try:
+                frame, state = read_current()
+                if self._abort:
+                    return None
+                if state == "on":
+                    log.info("Unresolved Pokemon is already favorited for review")
+                    return frame
+                if state == "off":
+                    check_review_generation(original)
+                    if not self._safe_tap(*self.regions.favorite_star_region.center, jitter=0):
+                        return None
+                    # A pause during the tap stays in the confirmation phase.
+                    # Never return to this toggle after it may have been sent.
+                    break
+            except _AppraisalConfirmationInvalidated:
+                log.info("Favorite review invalidated; rereading before any star input")
+                continue
             if attempt < 2:
                 human_delay(0.2, 1.0)
                 if self._abort:
@@ -920,13 +1446,15 @@ class IndexingStateMachine:
         else:
             raise RuntimeError("Could not favorite unresolved Pokemon: star not recognized")
 
-        if not self._safe_tap(*self.regions.favorite_star_region.center, jitter=0):
-            return None
         for _attempt in range(3):
             human_delay(0.2, 1.0)
             if self._abort:
                 return None
-            frame, state = read_current()
+            try:
+                frame, state = read_current()
+            except _AppraisalConfirmationInvalidated:
+                log.info("Favorite confirmation invalidated; rereading without another tap")
+                continue
             if self._abort:
                 return None
             if state == "on":
@@ -1075,9 +1603,11 @@ class IndexingStateMachine:
             return validate_snapshot(snapshot, self.use_calculated_cp), frame
         original_frame = frame
         generation = self._pause_generation
+        caught_review_only = False
 
         def check_confirmation_generation():
-            if self._pause_generation != generation:
+            if (self._pause_generation != generation
+                    or (caught_review_only and self._paused)):
                 raise _AppraisalConfirmationInvalidated("pause invalidated appraisal confirmation")
 
         for attempt in range(3):
@@ -1092,13 +1622,31 @@ class IndexingStateMachine:
                 return None, frame
             check_confirmation_generation()
             fresh = AppraisalSnapshot.from_reads(detail, appraisal)
-            if self._cp_recovery_identity(fresh) == identity:
+            exact_identity = self._cp_recovery_identity(fresh) == identity
+            if exact_identity and not caught_review_only:
                 break
-            self._record_recovery_identity_change(
+            if not exact_identity:
+                self._record_recovery_identity_change(
+                    snapshot, fresh, original_frame, frame,
+                    save_evidence=save_failure_evidence,
+                )
+            anchor = self._non_iv_recovery_identity(snapshot)
+            if (not caught_review_only and anchor is not None
+                    and self._non_iv_recovery_identity(fresh) == anchor
+                    and snapshot.ivs != fresh.ivs):
+                check_confirmation_generation()
+                raise _PreInputIVConflict(original_frame, frame, anchor, generation)
+            caught_drift = self._review_caught_name_drift(
                 snapshot, fresh, original_frame, frame,
-                save_evidence=save_failure_evidence,
+                allow_exact=caught_review_only,
             )
-            name_drift = self._review_name_drift(snapshot, fresh, original_frame, frame)
+            name_drift = (caught_drift if caught_review_only else
+                          caught_drift or self._review_name_drift(
+                              snapshot, fresh, original_frame, frame,
+                          ))
+            # Once the caught anchor is uncertain, a later return to its first
+            # spelling does not turn this review transaction into CP evidence.
+            caught_review_only = caught_review_only or caught_drift
             check_confirmation_generation()
             if not name_drift:
                 raise RuntimeError("CP recovery appraisal identity changed before closing")
@@ -1109,6 +1657,10 @@ class IndexingStateMachine:
                     return None, frame
         else:
             check_confirmation_generation()
+            if caught_review_only:
+                # This only enables stricter favorite-review checks. It does
+                # not authorize a match, a CP result, or a stored data row.
+                frame.info["pokemgr_review_caught_name_drift"] = True
             raise _UnresolvedAppraisalName(frame)
         fresh_decision = self._validate_appraisal_snapshot(fresh, frame)
         if self._abort:
@@ -1487,7 +2039,6 @@ class IndexingStateMachine:
         from contextlib import closing
         import math
         from .snapshot import (
-            appraisal_frames_stable,
             appraisal_region_diffs,
             appraisal_transition_observed,
         )
@@ -1527,7 +2078,10 @@ class IndexingStateMachine:
                     attempt, ",".join(f"{value:.2f}" for value in diffs), transition_seen,
                 )
                 with timing.span("screen.stability"):
-                    frames_stable = appraisal_frames_stable(previous, current)
+                    frames_stable = (
+                        max(diffs) <= 1.5
+                        and self.reader.appraisal_bars_stable(previous, current)
+                    )
                 if frames_stable:
                     settled_identity_changed = (
                         not require_transition or
@@ -1669,7 +2223,9 @@ class IndexingStateMachine:
         Reversing must reach the distinct previous accepted checkpoint, then
         moving forward must restore the last accepted checkpoint. An unseen
         identical neighbour instead reverses to the last checkpoint and fails
-        this proof. Probe reads never create rows or update identity history.
+        this proof. A delayed carousel response gets bounded fresh reads, never
+        another checkpoint swipe. Probe reads never create rows or update
+        identity history.
         """
         def stopped(reason):
             if self._abort:
@@ -1683,6 +2239,62 @@ class IndexingStateMachine:
                 and all(isinstance(value, int) and value > 0 for value in key[1:3])
                 and all(isinstance(value, int) and 0 <= value <= 15 for value in key[3:])
             )
+
+        confirmed_generation = None
+
+        def describe(key):
+            return f"{key[0]} CP{key[1]} HP{key[2]} IV{key[3]}/{key[4]}/{key[5]}"
+
+        def acquire_phase(checkpoint, expected_key=None, **kwargs):
+            nonlocal confirmed_generation
+            # Retain the current checkpoint/forward phase. Returning reacquire
+            # to the scan loop would lose which recovery gesture already ran.
+            for attempt in range(3):
+                while self._paused and not self._abort:
+                    with timing.span("wait.pause", session_id=self.session_id):
+                        time.sleep(0.25)
+                if self._abort:
+                    return None, None, "aborted", "abort requested"
+                generation = self._pause_generation
+                result = self._acquire_validated_snapshot(**kwargs)
+                if self._abort:
+                    return result
+                decision, read_frame, kind, _reason = result
+                if (kind == "reacquire" or self._paused
+                        or self._pause_generation != generation):
+                    result = (
+                        None, None, "reacquire",
+                        "pause invalidated failed-swipe confirmation",
+                    )
+                    log.info(
+                        "Failed-swipe %s confirmation invalidated; retaining recovery "
+                        "phase without repeating its swipe (read %d/3)",
+                        checkpoint, attempt + 1,
+                    )
+                    continue
+                if (expected_key is None or kind != "ok" or decision is None
+                        or not decision.accepted or decision.snapshot is None):
+                    return result
+                observed_key = self._complete_identity_key(decision.snapshot)
+                if observed_key is None:
+                    return (
+                        None, read_frame, "checkpoint_incomplete",
+                        "complete species, CP, HP and IV identity was unavailable",
+                    )
+                if observed_key == expected_key:
+                    confirmed_generation = generation
+                    return result
+                log.warning(
+                    "Failed-swipe %s checkpoint read %d/3: expected %s, observed %s",
+                    checkpoint, attempt + 1, expected_key, observed_key,
+                )
+                result = (
+                    None, read_frame, "checkpoint_mismatch",
+                    f"{checkpoint} checkpoint did not match after 3 read attempts "
+                    f"(expected {describe(expected_key)}, saw {describe(observed_key)}); "
+                    "position is uncertain; failed-swipe retry held",
+                )
+            return result
 
         previous_key = self._previous_validated_identity_key
         last_key = self._last_validated_identity_key
@@ -1716,25 +2328,32 @@ class IndexingStateMachine:
             if not moved:
                 return stopped(f"failed-swipe recovery could not reach {checkpoint} checkpoint")
 
-            decision, frame, kind, reason = self._acquire_validated_snapshot(
+            decision, frame, kind, reason = acquire_phase(
+                checkpoint, expected_key,
                 require_transition=False,
                 save_failure_evidence=False,
             )
             if self._abort:
                 return stopped("abort requested")
+            if kind == "checkpoint_mismatch":
+                return stopped(reason)
             if (kind != "ok" or decision is None or not decision.accepted
                     or decision.snapshot is None):
                 return stopped(f"{checkpoint} checkpoint was not exact: {reason}")
-            if self._complete_identity_key(decision.snapshot) != expected_key:
-                return stopped(f"{checkpoint} checkpoint did not match; failed-swipe retry held")
             log.info("Failed-swipe %s checkpoint confirmed: %s", checkpoint, expected_key)
 
         # The final transition must be measured from the restored last row,
         # never from the temporary reverse checkpoint.
         self._last_stable_image = frame
+        self._last_accepted_image = (
+            frame if not self._paused and self._pause_generation == confirmed_generation
+            else None
+        )
+        self._last_accepted_pause_generation = confirmed_generation
         if not self._advance_from_confirmed_appraisal():
             return stopped("failed-swipe retry could not advance from restored appraisal")
-        decision, frame, kind, reason = self._acquire_validated_snapshot(
+        decision, frame, kind, reason = acquire_phase(
+            "forward retry",
             previous_accepted=self._last_stable_image,
             require_transition=True,
         )
@@ -1748,23 +2367,62 @@ class IndexingStateMachine:
     @timing.timed("scan.advance", scan=True)
     def _advance_from_confirmed_appraisal(self) -> bool:
         """Advance once only after a fresh screenshot confirms appraisal."""
-        if self._abort:
+        while not self._abort:
+            while self._paused and not self._abort:
+                with timing.span("wait.pause", session_id=self.session_id):
+                    time.sleep(.25)
+            if self._abort:
+                return False
+            generation = self._pause_generation
+            frame = self._fast_screencap()
+            with timing.span("screen.detect"):
+                screen = self.nav.detect_screen(frame)
+            if self._paused or self._pause_generation != generation:
+                continue
+            if screen != "appraisal":
+                return False
+            if self._advance_appraisal(frame, pause_generation=generation):
+                return True
+            if self._paused or self._pause_generation != generation:
+                continue
             return False
-        frame = self._fast_screencap()
-        with timing.span("screen.detect"):
-            screen = self.nav.detect_screen(frame)
-        if screen != "appraisal":
+        return False
+
+    @timing.timed("scan.forward_input", scan=True)
+    def _advance_appraisal(self, frame, *, pause_generation=None) -> bool:
+        """Send one observed-arrow tap or one calibrated fallback swipe.
+
+        False on a pause/generation change means no input was sent. A pause
+        after sending input retains the completed operation's result so callers
+        cannot replay a forward move. Existing abort semantics remain intact.
+        """
+        from ..reader.appraisal_navigation import next_appraisal_target
+
+        generation = self._pause_generation if pause_generation is None else pause_generation
+
+        def interrupted():
+            return (self._abort or self._paused or self._pause_generation != generation)
+
+        if interrupted():
+            return False
+        target = next_appraisal_target(frame)
+        if interrupted():
             return False
         self._last_stable_image = frame
+        if target is not None:
+            log.debug("Advancing appraisal through observed right arrow at %s", target)
+            return bool(self._safe_tap(*target, jitter=0))
         return bool(self._fast_swipe())
 
     # ── Helpers ───────────────────────────────────────────────────────
 
+    # TRACEWEAVER: entrypoint=IndexingStateMachine._read_appraisal_snapshot; req=REQ-SCAN-001; trace=TRACE-SCAN-001; ver=VER-SCAN-001
     @timing.timed("reader.snapshot")
     def _read_appraisal_snapshot(self, image):
         """Read IVs, HP, and identity from one frame before considering CP OCR."""
         import threading
         from ..reader.ocr import is_in_gym, read_caught_species
+        from ..reader.nidoran import is_nidoran_read, resolve_caught_nidoran
 
         # One native request supplies every text field from this exact image.
         # Complete it before starting workers so neither can duplicate the IPC.
@@ -1772,6 +2430,7 @@ class IndexingStateMachine:
         hp_result = [-1]
         gym_result = [False]
         caught_species_result = [""]
+        nidoran_gender_result = [""]
         background_error = [None]
 
         @timing.timed("reader.hp_gym_caught")
@@ -1779,7 +2438,10 @@ class IndexingStateMachine:
             try:
                 w = self.regions.screen_width
                 h = self.regions.screen_height
-                gym_result[0] = is_in_gym(image, w, h)
+                gym_result[0] = (
+                    getattr(native, "in_gym", False) is True
+                    or is_in_gym(image, w, h)
+                )
                 if not gym_result[0]:
                     hp_result[0] = self.reader.read_hp(image)
                 caught_species_result[0] = (
@@ -1787,6 +2449,14 @@ class IndexingStateMachine:
                     if native is not None and native.caught_species
                     else read_caught_species(image, w, h, density=self.profile.density)
                 )
+                if is_nidoran_read(caught_species_result[0]):
+                    nidoran_gender_result[0] = self.reader.specimen_gender(image)
+                    resolved = resolve_caught_nidoran(
+                        caught_species_result[0], nidoran_gender_result[0],
+                    )
+                    if resolved is None:
+                        raise ValueError("Nidoran caught name and sex evidence are unresolved or conflicting")
+                    caught_species_result[0] = resolved
             except Exception as exc:
                 background_error[0] = exc
 
@@ -1813,6 +2483,9 @@ class IndexingStateMachine:
         detail["hp"] = hp_result[0]
         detail["in_gym"] = gym_result[0]
         detail["caught_species"] = caught_species_result[0]
+        if (detail["snapshot_read_complete"]
+                and nidoran_gender_result[0] in ("male", "female")):
+            detail["gender"] = nidoran_gender_result[0]
 
         # Candy identifies an evolution family, not the active species. Read
         # its label only as a fallback when the professor text is unavailable;

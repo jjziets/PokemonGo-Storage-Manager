@@ -1,3 +1,5 @@
+# TRACEWEAVER: file-role=inventory-queue-entry; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+# TRACEWEAVER: entrypoint=run_gui; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 """PySide6 application entry point."""
 
 import sys
@@ -24,8 +26,13 @@ log = logging.getLogger(__name__)
 
 
 def run_gui(*, start_scan: bool = False, skip_first: int = 0,
-            resume_species: str = "", resume_cp: int = 0):
+            resume_species: str = "", resume_cp: int = 0, scan_queue: str | None = None):
     """Launch the Pokemon Manager GUI."""
+    if scan_queue is not None:
+        from ..indexer.scan_queue import load_scan_queue
+        if start_scan or skip_first or resume_species or resume_cp:
+            raise ValueError("A scan queue cannot be combined with automatic default or resume scanning")
+        load_scan_queue(scan_queue)
     app = QApplication(sys.argv)
     app.setApplicationName("Pokemon Go Storage Manager")
     app.setStyle("Fusion")
@@ -61,4 +68,8 @@ def run_gui(*, start_scan: bool = False, skip_first: int = 0,
             window.start_default_scan, skip_first=skip_first,
             resume_species=resume_species, resume_cp=resume_cp,
         ))
+    elif scan_queue is not None:
+        from functools import partial
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, partial(window.start_scan_queue, scan_queue))
     sys.exit(app.exec())

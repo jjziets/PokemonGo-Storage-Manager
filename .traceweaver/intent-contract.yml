@@ -5,7 +5,7 @@
   "baseline_id": "REQ-BASELINE-2026-09-09-001",
   "baseline_hash_sha256": "4b966981a29f704128139ccb4c85dfd6dcdbd456e08911d06a2b4379c2fb929a",
   "baseline_source": "requirements.md",
-  "source": "Explicit owner requests in current Codex conversation, September8\u20139,2026",
+  "source": "Explicit owner requests in current Codex conversation, September8\u201310,2026",
   "supersedes": "REQ-BASELINE-2026-08-24-001",
   "requirements": [
     [
@@ -46,17 +46,36 @@
     ]
   ],
   "publication": {
-    "authorization": "commit/pr and merge",
+    "authorization": "nice lets udpate the app and then commit and push",
+    "source_date": "2026-09-10",
     "repo": "jjziets/PokemonGo-Storage-Manager",
     "remote": "git@github.com:jjziets/PokemonGo-Storage-Manager.git",
     "base": "dev",
-    "head": "codex/stream-scanning-and-keepers",
-    "merge_method": "squash"
+    "head": "dev",
+    "operations": [
+      "stage",
+      "commit",
+      "push"
+    ],
+    "constraint": "A scan is running. Do not interact with the phone, restart the app, or change production data during this work."
   },
   "held_claims": [
     "Complete storage reliability",
     "Complete keeper/transfer advice",
     "Measured GPU usage",
     "Deployment or GUI runtime reload"
-  ]
+  ],
+  "publication_history": [
+    {
+      "authorization": "commit/pr and merge",
+      "repo": "jjziets/PokemonGo-Storage-Manager",
+      "remote": "git@github.com:jjziets/PokemonGo-Storage-Manager.git",
+      "base": "dev",
+      "head": "codex/stream-scanning-and-keepers",
+      "merge_method": "squash"
+    }
+  ],
+  "followups": {
+    "2026-09-10": "Reuse a fixed 968x2376/420 app-stream canvas across compatible Android devices; preserve device-specific verification and data. Includes the explicitly requested scanning and favorite fixes since the prior publication."
+  }
 }

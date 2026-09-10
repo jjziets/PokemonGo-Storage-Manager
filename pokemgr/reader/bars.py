@@ -15,6 +15,7 @@ from ..calibration.regions import BBox
 
 log = logging.getLogger(__name__)
 
+# TRACEWEAVER: file-role=iv-bar-settling; req=REQ-SCAN-001; trace=TRACE-SCAN-001; ver=VER-SCAN-001
 NUM_SEGMENTS = 15  # IV bars have 15 segments (values 0-15)
 
 # Bar region to scan within (X range where bars appear, Y range to search)
@@ -62,7 +63,7 @@ def find_bars(image: Image.Image) -> list[BBox] | None:
     Scans vertically in the expected region for rows of bar-colored pixels.
     Returns list of 3 BBox (ATK, DEF, STA) or None if not found.
     """
-    arr = np.array(image)
+    arr = np.asarray(image)
     h, w = arr.shape[:2]
 
     # Scale search area based on actual screen size
@@ -73,22 +74,21 @@ def find_bars(image: Image.Image) -> list[BBox] | None:
     y_start = int(BAR_SEARCH_Y_START * sy)
     y_end = min(int(BAR_SEARCH_Y_END * sy), h - 1)
 
-    # Sample at x midpoint of bar area
-    sample_x = (x_start + x_end) // 2
-
-    # Scan vertically: for each row, check if it's a bar row
-    bar_rows = []
-    for y in range(y_start, y_end):
-        # Sample a few pixels across the bar width
-        bar_count = 0
-        for x in range(x_start + 20, x_end - 20, 30):
-            if x < w:
-                r, g, b = arr[y, x, :3]
-                if _is_bar_pixel(float(r), float(g), float(b)):
-                    bar_count += 1
-        # If most samples are bar pixels, this is a bar row
-        if bar_count >= 3:
-            bar_rows.append(y)
+    # Apply the same color predicate to the sparse sample grid in one NumPy
+    # operation. This keeps the exact sample locations and three-pixel rule
+    # while avoiding thousands of Python pixel visits per independent frame.
+    sample_x = np.arange(x_start + 20, x_end - 20, 30)
+    samples = arr[y_start:y_end, sample_x[sample_x < w], :3]
+    r, g, b = samples[..., 0], samples[..., 1], samples[..., 2]
+    orange = ((r > 225) & (r < 255) & (g > 145) & (g < 185)
+              & (b > 55) & (b < 100))
+    pink = ((r > 205) & (r < 240) & (g > 110) & (g < 145)
+            & (b > 110) & (b < 145))
+    gray = ((r > 218) & (r < 232) & (g > 218) & (g < 232)
+            & (b > 218) & (b < 232)
+            & (samples.max(axis=2) - samples.min(axis=2) < 10))
+    bar_rows = (np.flatnonzero((orange | pink | gray).sum(axis=1) >= 3)
+                + y_start).tolist()
 
     if not bar_rows:
         return None
@@ -206,6 +206,75 @@ def read_bars_dynamic(image: Image.Image) -> dict | None:
         "sta": sta,
         "confidence": (atk_c + def_c + sta_c) / 3,
     }
+
+
+# TRACEWEAVER: entrypoint=appraisal_bars_stable; req=REQ-SCAN-001; trace=TRACE-SCAN-001; ver=VER-SCAN-001
+def appraisal_bars_stable(first: Image.Image, second: Image.Image, *,
+                          fallback_regions=None) -> bool:
+    """Require stable values, fill edges and colors on all three IV bars.
+
+    Whole-card averages can hide a narrow bar still filling. Compare its
+    central three rows directly, allowing at most one scaled pixel of fill
+    jitter and a mean RGB difference of 3 for compression noise. This rejects
+    movement within a rounded IV and the orange-to-pink maximum transition.
+    Calibrated regions are used only when dynamic detection is unavailable.
+    """
+    if first is second or first.size != second.size:
+        return False
+    first_boxes = find_bars(first)
+    second_boxes = find_bars(second)
+    first_boxes = first_boxes if first_boxes is not None else fallback_regions
+    second_boxes = second_boxes if second_boxes is not None else fallback_regions
+    if first_boxes is None or second_boxes is None or len(first_boxes) != 3 or len(second_boxes) != 3:
+        return False
+    width, height = first.size
+    x_tolerance = max(1., 2 * width / 968)
+    y_tolerance = max(1., 2 * height / 2376)
+    fill_tolerance = max(1., width / 968)
+    arrays = [np.asarray(image if image.mode == "RGB" else image.convert("RGB"))
+              for image in (first, second)]
+
+    def valid(box):
+        return (isinstance(box, BBox)
+                and all(type(value) is int for value in (box.x, box.y, box.w, box.h))
+                and box.w >= 15 and box.h >= 3 and box.x >= 0 and box.y >= 0
+                and box.x2 <= width and box.y2 <= height)
+
+    for index, (a, b) in enumerate(zip(first_boxes, second_boxes)):
+        if not valid(a) or not valid(b):
+            return False
+        if index and (a.y < first_boxes[index - 1].y2 or b.y < second_boxes[index - 1].y2):
+            return False
+        if (max(abs(a.x - b.x), abs(a.w - b.w)) > x_tolerance
+                or max(abs(a.y - b.y), abs(a.h - b.h)) > y_tolerance):
+            return False
+        value_a, confidence_a = read_iv_bar(first, a)
+        value_b, confidence_b = read_iv_bar(second, b)
+        if value_a != value_b or min(confidence_a, confidence_b) < .9:
+            return False
+        # Shared screen coordinates avoid introducing interpolation or moving
+        # a fill edge merely because the detected rounded cap shifts one pixel.
+        left, right = max(a.x, b.x), min(a.x2, b.x2)
+        middle = round((a.y + a.h / 2 + b.y + b.h / 2) / 2)
+        top, bottom = max(a.y, b.y, middle - 1), min(a.y2, b.y2, middle + 2)
+        if right - left < 15 or bottom - top < 2:
+            return False
+        profiles = [array[top:bottom, left:right].mean(axis=0) for array in arrays]
+        filled = []
+        for profile in profiles:
+            # White empty calibration boxes must not masquerade as three
+            # stable zero-IV bars. Require the expected bar palette itself.
+            if sum(_is_bar_pixel(*rgb) for rgb in profile) < .8 * len(profile):
+                return False
+            filled.append((profile[:, 0] >= 200) & (np.ptp(profile, axis=1) > 30))
+        if abs(int(filled[0].sum()) - int(filled[1].sum())) > fill_tolerance:
+            return False
+        edges = [int(np.flatnonzero(mask)[-1]) if mask.any() else -1 for mask in filled]
+        if abs(edges[0] - edges[1]) > fill_tolerance:
+            return False
+        if float(np.abs(profiles[0] - profiles[1]).mean()) > 3.:
+            return False
+    return True
 
 
 def are_bars_present(image: Image.Image) -> bool:

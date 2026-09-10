@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from pokemgr.gui.main_window import MainWindow
 from pokemgr.gui.widgets.mass_actions import MassActions
+from tests.test_mass_action_scanning import pokemon
 
 
 class Event:
@@ -31,8 +32,9 @@ def worker():
 def window():
     result = SimpleNamespace(adb=Mock(), profile=Mock(), db=Mock(), decision_tab=Mock(),
                              mass_tab=Mock(), _scan_worker=None, _mass_worker=None,
+                             _refresh_collection=Mock(), _refresh_decisions=Mock(),
                              _apply_speed_settings=Mock(), statusBar=Mock(return_value=Mock()))
-    result.db.get_all.return_value = [SimpleNamespace(decision='KEEP', favorited=False)]
+    result.db.get_all.return_value = [pokemon()]
     result.decision_tab.get_selected_fav_passes.return_value = ['Normal', 'Shiny']
     for name in ('_start_mass_worker', '_on_mass_action_finished', '_start_favorite',
                  '_unfavorite_all', '_start_favorite_filter', '_toggle_mass_pause',

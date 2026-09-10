@@ -1,5 +1,5 @@
 diff --git a/app/meson.build b/app/meson.build
-index 8816426..80f5336 100644
+index 8816426..5725e72 100644
 --- a/app/meson.build
 +++ b/app/meson.build
 @@ -27,6 +27,7 @@ src = [
@@ -10,7 +10,7 @@ index 8816426..80f5336 100644
      'src/receiver.c',
      'src/recorder.c',
      'src/scrcpy.c',
-@@ -127,9 +128,14 @@ dependencies = [
+@@ -127,9 +128,17 @@ dependencies = [
      dependency('libavcodec', version: '>= 57.37', static: static),
      dependency('libavutil', static: static),
      dependency('libswresample', static: static),
@@ -19,7 +19,10 @@ index 8816426..80f5336 100644
  ]
  
 +if host_machine.system() == 'darwin'
-+    dependencies += dependency('appleframeworks', modules: ['Accelerate'])
++    add_languages('objc', native: false)
++    add_project_arguments('-fno-objc-arc', language: 'objc')
++    src += 'src/pokemgr_activity.m'
++    dependencies += dependency('appleframeworks', modules: ['Accelerate', 'Foundation'])
 +endif
 +
  if v4l2_support

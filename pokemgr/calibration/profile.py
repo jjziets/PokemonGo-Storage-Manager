@@ -4,19 +4,20 @@ import copy
 import json
 import logging
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import CALIBRATIONS_DIR
 from ..adb.device import DeviceInfo
-from .regions import ScreenRegions, is_tablet_layout
+from .regions import BBox, ScreenRegions, is_tablet_layout
 
 log = logging.getLogger(__name__)
 
 PROFILE_SCHEMA_VERSION = 2
 COORDINATE_SOURCE_TEMPLATE = "template"
 COORDINATE_SOURCE_LEGACY = "legacy_profile"
+COORDINATE_SOURCE_SHARED = "shared_profile"
 VERIFICATION_UNVERIFIED = "unverified"
 VERIFICATION_VERIFIED = "verified"
 
@@ -59,11 +60,16 @@ class CalibrationProfile:
 
     @property
     def fingerprint(self) -> str:
+        return f"{self.legacy_fingerprint}_dpi{self.density}"
+
+    @property
+    def legacy_fingerprint(self) -> str:
+        """Previous identity, accepted only alongside exact geometry metadata."""
         return f"{self.device_model}_{self.serial}_{self.resolution}"
 
     @staticmethod
     def fingerprint_for(info: DeviceInfo) -> str:
-        return f"{info.model}_{info.serial}_{info.resolution}"
+        return f"{info.model}_{info.serial}_{info.resolution}_dpi{info.density}"
 
     @staticmethod
     def _layout_for(width: int, height: int, density: int) -> str:
@@ -78,6 +84,50 @@ class CalibrationProfile:
     def path(self, directory: Path | str | None = None) -> Path:
         directory = Path(directory) if directory else CALIBRATIONS_DIR
         return directory / f"{self.fingerprint}.json"
+
+    @staticmethod
+    def _legacy_path_for_device(info: DeviceInfo, directory: Path) -> Path:
+        return directory / f"{info.model}_{info.serial}_{info.resolution}.json"
+
+    def _matches_geometry(self, info: DeviceInfo) -> bool:
+        """Do not infer layout compatibility from pixel dimensions alone."""
+        return (all(type(value) is int and value > 0 for value in (
+                    self.density, self.regions.screen_width, self.regions.screen_height,
+                    info.density, info.width, info.height,
+                ))
+                and self.resolution == info.resolution
+                and self.density == info.density
+                and (self.regions.screen_width, self.regions.screen_height) == (info.width, info.height)
+                and self.layout == self._layout_for(info.width, info.height, info.density))
+
+    def _matches_device(self, info: DeviceInfo) -> bool:
+        return (self.device_model == info.model and self.serial == info.serial
+                and self._matches_geometry(info))
+
+    @staticmethod
+    def _coordinates_fit_canvas(regions: ScreenRegions) -> bool:
+        """Shared coordinates must describe usable pixels on this canvas."""
+        width, height = regions.screen_width, regions.screen_height
+        if not all(type(value) is int and value > 0 for value in (width, height)):
+            return False
+        for definition in fields(ScreenRegions):
+            if definition.name in ("screen_width", "screen_height", "swipe_duration_ms"):
+                continue
+            value = getattr(regions, definition.name)
+            if definition.type is BBox:
+                if (not isinstance(value, BBox)
+                        or not all(type(part) is int for part in (value.x, value.y, value.w, value.h))
+                        or value.x < 0 or value.y < 0 or value.w <= 0 or value.h <= 0
+                        or value.x2 > width or value.y2 > height):
+                    return False
+            elif value is None and definition.default is None:
+                # Only the optional navigation targets have None defaults.
+                continue
+            elif (not isinstance(value, tuple) or len(value) != 2
+                  or not all(type(part) is int for part in value)
+                  or not (0 <= value[0] < width and 0 <= value[1] < height)):
+                return False
+        return True
 
     # ── Persistence ──────────────────────────────────────────────────
 
@@ -189,7 +239,11 @@ class CalibrationProfile:
     @classmethod
     def find_for_device(cls, info: DeviceInfo,
                         directory: Path | str | None = None) -> "CalibrationProfile | None":
-        """Look for an existing calibration profile matching the device fingerprint."""
+        """Load this device's profile or borrow compatible coordinates in memory.
+
+        Existing device overrides win. A shared result remains unverified and
+        is not saved until the caller explicitly saves the returned profile.
+        """
         directory = Path(directory) if directory else CALIBRATIONS_DIR
         if not directory.exists():
             return None
@@ -197,11 +251,80 @@ class CalibrationProfile:
         fingerprint = cls.fingerprint_for(info)
         path = cls.path_for_device(info, directory)
         if path.exists():
+            profile = cls.load(path)
+            if not profile._matches_device(info):
+                raise ValueError(f"Saved calibration does not match device geometry: {path.name}")
             log.info("Found calibration profile: %s", path)
-            return cls.load(path)
+            return profile
+
+        legacy = cls._legacy_path_for_device(info, directory)
+        if legacy.exists():
+            profile = cls.load(legacy)
+            if profile._matches_device(info):
+                log.info("Found matching legacy calibration without changing its file: %s", legacy)
+                return profile
+            log.warning("Ignoring legacy calibration with different device geometry: %s", legacy.name)
+
+        shared = cls._shared_coordinates(info, directory)
+        if shared is not None:
+            return shared
 
         log.info("No calibration profile found for %s", fingerprint)
         return None
+
+    @classmethod
+    def _shared_coordinates(cls, info: DeviceInfo, directory: Path) -> "CalibrationProfile | None":
+        candidates = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                # Check supplied values before legacy migration can replace a
+                # malformed falsey optional target with a template default.
+                raw_regions = ScreenRegions.from_dict(json.loads(path.read_text())["regions"])
+                if not cls._coordinates_fit_canvas(raw_regions):
+                    log.warning("Ignoring shared calibration with invalid coordinates: %s", path.name)
+                    continue
+                donor = cls.load(path)
+                if (not donor.device_model or not donor.serial or not donor._matches_geometry(info)
+                        or (donor.device_model, donor.serial) == (info.model, info.serial)
+                        or not cls._coordinates_fit_canvas(donor.regions)):
+                    continue
+                qualified = donor.path(directory)
+                legacy = directory / f"{donor.legacy_fingerprint}.json"
+                if path not in (qualified, legacy):
+                    continue
+                # A density-qualified donor supersedes its older file too.
+                if path == legacy and qualified.exists():
+                    continue
+                coordinates = donor.regions.to_dict()
+                coordinates.pop("swipe_duration_ms")
+                candidates.append((path, donor, coordinates))
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                log.warning("Ignoring unreadable shared calibration candidate: %s", path.name)
+
+        verified = [candidate for candidate in candidates
+                    if candidate[1].metadata.get("verification_status") == VERIFICATION_VERIFIED]
+        candidates = verified or candidates
+        if not candidates:
+            return None
+        path, donor, coordinates = candidates[0]
+        if any(candidate[2] != coordinates for candidate in candidates[1:]):
+            log.warning("Compatible calibration donors disagree; no coordinates were shared")
+            return None
+
+        shared = cls.create_default(info)
+        duration = shared.regions.swipe_duration_ms
+        shared.regions = copy.deepcopy(donor.regions)
+        shared.regions.swipe_duration_ms = duration
+        shared.metadata = {
+            "coordinate_source": COORDINATE_SOURCE_SHARED,
+            "verification_status": VERIFICATION_UNVERIFIED,
+            "shared_from_fingerprint": donor.fingerprint,
+            "shared_from_profile": path.name,
+            "shared_geometry": f"{info.resolution}/dpi{info.density}/{shared.layout}",
+        }
+        log.info("Reusing compatible coordinates from %s for %s; device verification is unverified",
+                 path.name, shared.fingerprint)
+        return shared
 
     @classmethod
     def create_default(cls, info: DeviceInfo) -> "CalibrationProfile":
@@ -241,7 +364,9 @@ class CalibrationProfile:
         directory = Path(directory) if directory else CALIBRATIONS_DIR
         source = cls.path_for_device(info, directory)
         if not source.exists():
-            return None
+            source = cls._legacy_path_for_device(info, directory)
+            if not source.exists():
+                return None
 
         backup_directory = (
             Path(backup_directory) if backup_directory else directory / "backups"

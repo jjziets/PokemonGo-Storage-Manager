@@ -1,3 +1,4 @@
+/* TRACEWEAVER: file-role=native-frame-export; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-STREAM-ACTIVITY-001 */
 #include "pokemgr_frame_sink.h"
 
 #include <ctype.h>
@@ -13,6 +14,7 @@
 #ifdef __APPLE__
 # include <mach/mach_time.h>
 # include <Accelerate/Accelerate.h>
+# include "pokemgr_activity.h"
 #endif
 
 #include <libavutil/pixdesc.h>
@@ -23,9 +25,20 @@
 #define DOWNCAST(SINK) container_of(SINK, struct sc_pk_frame_sink, frame_sink)
 #define MAX_PIXELS (UINT64_C(4096) * 4096)
 
+static void
+end_activity(struct sc_pk_frame_sink *sink) {
+#ifdef __APPLE__
+    sc_pk_activity_end(sink->activity);
+    sink->activity = NULL;
+#else
+    (void) sink;
+#endif
+}
+
 static bool
 fail(struct sc_pk_frame_sink *sink, const char *reason) {
     sink->failed = true;
+    end_activity(sink);
     if (sink->header) {
         atomic_store_explicit(&sink->header->status, SC_PK_FRAME_ERROR,
                               memory_order_release);
@@ -66,7 +79,7 @@ sink_open(struct sc_frame_sink *frame_sink, const AVCodecContext *ctx,
     sink->fd = open(sink->path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (sink->fd < 0) {
         LOGE("Pokemon frame buffer: exclusive create failed: %s", strerror(errno));
-        return false;
+        return fail(sink, "could not exclusively create buffer file");
     }
     if (ftruncate(sink->fd, (off_t) mapping_size)) {
         return fail(sink, "could not size buffer file");
@@ -297,6 +310,7 @@ sink_push_session(struct sc_frame_sink *frame_sink,
 static void
 sink_close(struct sc_frame_sink *frame_sink) {
     struct sc_pk_frame_sink *sink = DOWNCAST(frame_sink);
+    end_activity(sink);
     if (sink->header && atomic_load_explicit(&sink->header->status,
                                             memory_order_acquire) != SC_PK_FRAME_ERROR) {
         atomic_store_explicit(&sink->header->status, SC_PK_FRAME_CLOSED,
@@ -304,6 +318,7 @@ sink_close(struct sc_frame_sink *frame_sink) {
     }
 }
 
+/* TRACEWEAVER: entrypoint=sc_pk_frame_sink_init; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-STREAM-ACTIVITY-001 */
 bool
 sc_pk_frame_sink_init(struct sc_pk_frame_sink *sink, const char *path,
                       const char *nonce) {
@@ -329,9 +344,19 @@ sc_pk_frame_sink_init(struct sc_pk_frame_sink *sink, const char *path,
         .close = sink_close,
     };
     sink->frame_sink.ops = &ops;
+#ifdef __APPLE__
+    /* TRACEWEAVER: req=REQ-STREAM-001; trace=TRACE-STREAM-001 */
+    sink->activity = sc_pk_activity_begin();
+    if (!sink->activity) {
+        free(sink->path);
+        sink->path = NULL;
+        return fail(sink, "could not begin frame export activity");
+    }
+#endif
     return true;
 }
 
+/* TRACEWEAVER: entrypoint=sc_pk_frame_sink_destroy; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-STREAM-ACTIVITY-001 */
 void
 sc_pk_frame_sink_destroy(struct sc_pk_frame_sink *sink) {
     sink_close(&sink->frame_sink);

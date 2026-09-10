@@ -1,3 +1,4 @@
+# TRACEWEAVER: file-role=stable-scan-loop-tests; req=REQ-SCAN-003; trace=TRACE-SCAN-003; verifies=VER-SCAN-001
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -275,6 +276,7 @@ class StableScanLoopTests(unittest.TestCase):
                          pokemon_a, pokemon_a, pokemon_a]
         )
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
 
         frame, status = sm._wait_for_stable_appraisal(
@@ -300,6 +302,7 @@ class StableScanLoopTests(unittest.TestCase):
                 second.info["pokemgr_capture_started_at"] = 101.0
                 sm._fast_screencap = Mock(side_effect=[first, second])
                 sm.reader.are_bars_visible = Mock(return_value=True)
+                sm.reader.appraisal_bars_stable = Mock(return_value=True)
                 sm.nav.detect_screen = Mock(return_value="appraisal")
 
                 with patch("pokemgr.indexer.state_machine.time.monotonic",
@@ -330,6 +333,7 @@ class StableScanLoopTests(unittest.TestCase):
         first, second = adb.screencap(), adb.screencap()
         sm._fast_screencap = Mock(side_effect=[first, second])
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
 
         frame, status = sm._wait_for_stable_appraisal()

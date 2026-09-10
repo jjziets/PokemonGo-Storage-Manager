@@ -60,6 +60,7 @@ class StreamDisplayTests(unittest.TestCase):
         os.environ.pop("POKEMGR_DISPLAY_ID", None)
         os.environ.pop("POKEMGR_CAPTURE_DISPLAY_ID", None)
         os.environ.pop("POKEMGR_DEVICE_SERIAL", None)
+        os.environ.pop("POKEMGR_EXPECTED_DISPLAY_GEOMETRY", None)
         self.logical_displays = f"Displays:\n{PHYSICAL_DISPLAY}\n{VIRTUAL_DISPLAY}\n"
         self.capture_displays = CAPTURE_DISPLAYS
         self.capture_png = self.png
@@ -106,6 +107,41 @@ class StreamDisplayTests(unittest.TestCase):
             for command in self._shell_commands(adb)
             if command.startswith("input ")
         ]
+
+    def test_requested_geometry_is_checked_before_capture_or_input(self):
+        os.environ["POKEMGR_EXPECTED_DISPLAY_GEOMETRY"] = "968x2376/420"
+        original = self.logical_displays
+        for old, new in (("real 968 x 2376", "real 1080 x 2400"),
+                         ("density 420", "density 280"),
+                         ("real 968 x 2376", "real 2376 x 968")):
+            with self.subTest(new=new):
+                self.logical_displays = original.replace(old, new)
+                adb = self._controller()
+                with self.assertRaisesRegex(ADBError, "requested resolution and density"):
+                    adb.screencap()
+                with self.assertRaisesRegex(ADBError, "requested resolution and density"):
+                    adb.tap(200, 300, jitter=0)
+                self.assertFalse(self._inputs(adb))
+                self.assertTrue(all(call.args[0][0] != "exec-out" for call in adb._run.call_args_list))
+
+    def test_matching_geometry_uses_virtual_coordinates_and_is_frozen_at_construction(self):
+        os.environ["POKEMGR_EXPECTED_DISPLAY_GEOMETRY"] = "968x2376/420"
+        adb = self._controller()
+        os.environ["POKEMGR_EXPECTED_DISPLAY_GEOMETRY"] = "1440x2304/280"
+        info = adb.get_device_info()
+        self.assertEqual((968, 2376, 420), (info.width, info.height, info.density))
+        self.assertEqual((968, 2376), adb.screencap().size)
+
+    def test_expected_geometry_must_be_valid_and_bound_to_a_virtual_display(self):
+        for value in ("968x2376", "0x2376/420", "968x2376/0", "968x2376/-1", ""):
+            with self.subTest(value=value), self.assertRaises(ADBError):
+                os.environ["POKEMGR_EXPECTED_DISPLAY_GEOMETRY"] = value
+                self._controller()
+        os.environ["POKEMGR_EXPECTED_DISPLAY_GEOMETRY"] = "968x2376/420"
+        os.environ.pop("POKEMGR_DISPLAY_ID", None)
+        os.environ.pop("POKEMGR_CAPTURE_DISPLAY_ID", None)
+        with self.assertRaisesRegex(ADBError, "requires an app display"):
+            self._controller(targeted=False)
 
     def test_logical_and_capture_ids_are_independent_and_frozen(self):
         adb = self._controller()

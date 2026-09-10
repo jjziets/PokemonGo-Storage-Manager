@@ -64,6 +64,13 @@ class ADBController:
         self._capture_display_id = int(capture) if capture is not None else None
         self._display_unique_id = None
         self._display_geometry = None
+        expected_geometry = os.environ.get("POKEMGR_EXPECTED_DISPLAY_GEOMETRY")
+        self._expected_display_geometry = None
+        if expected_geometry is not None:
+            match = re.fullmatch(r"([1-9][0-9]*)x([1-9][0-9]*)/([1-9][0-9]*)", expected_geometry)
+            if logical is None or match is None:
+                raise ADBError("Expected display geometry requires an app display and WIDTHxHEIGHT/DPI")
+            self._expected_display_geometry = tuple(int(value) for value in match.groups())
         self._target_serial = self.serial if logical is not None else None
         self._capture_format = capture_format
         self._jpeg_unsupported = False
@@ -221,6 +228,9 @@ class ADBController:
         geometry = (int(size.group(1)), int(size.group(2)), int(density.group(1)))
         if any(value <= 0 for value in geometry):
             raise ADBError("Virtual display has invalid dimensions or density")
+        if self._expected_display_geometry is not None and geometry != self._expected_display_geometry:
+            raise ADBError("App display does not match the requested resolution and density "
+                           f"(expected {self._expected_display_geometry}, saw {geometry}); restart the stream")
         if self._display_unique_id is not None and unique.group(1) != self._display_unique_id:
             raise ADBError("Virtual display was recreated; restart the stream connection")
         if self._display_geometry is not None and geometry != self._display_geometry:

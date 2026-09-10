@@ -1,13 +1,14 @@
 """Freshness selection over a video ring must use original source time."""
+# TRACEWEAVER: file-role=fresh-stream-capture-tests; verifies=VER-SCAN-001; req=REQ-STREAM-001; trace=TRACE-STREAM-001
 
 import unittest
 import threading
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 from PIL import Image
 
 from pokemgr.adb.clock_sync import FrameTimeBounds
-from pokemgr.adb.frame_buffer import StreamFrame
+from pokemgr.adb.frame_buffer import FrameBufferError, StreamFrame
 from pokemgr.adb.stream_capture import StreamCapture, StreamCaptureTimeout
 
 
@@ -48,20 +49,118 @@ class StreamCaptureTests(unittest.TestCase):
         with self.assertRaises(StreamCaptureTimeout):
             self.source.capture(timeout=0.02)
         self.assertEqual(0, self.source._last_sequence)
+        self.assertEqual(-1, self.source._last_pts_us)
+        self.source.buffer.read.assert_called_once_with(1)
+        self.source.clock.map_pts_us.assert_called_once()
+        self.assertEqual(started + 20_000_000, self.now)
 
-    def test_capture_waits_for_source_after_request_even_without_any_input(self):
+    def test_repeated_stale_sequence_is_copied_once_before_fresh_frame_arrives(self):
         started = self.now
         old, new = self.frame(1, started - 1_000_000), self.frame(2, started + 3_000_000)
-        self.source.buffer.latest_sequence = 2
-        self.source.buffer.read.side_effect = [old, new]
+        self.source.buffer.latest_sequence = 1
+        self.source.buffer.read.side_effect = lambda sequence: {1: old, 2: new}[sequence]
+
+        def publish_after_wait(seconds):
+            self.sleep(seconds)
+            if self.now - started >= 15_000_000:
+                self.source.buffer.latest_sequence = 2
+
+        self.enterContext(patch("pokemgr.adb.stream_capture.time.sleep",
+                                side_effect=publish_after_wait))
         image = self.source.capture(timeout=0.02)
+        self.assertIs(new.image, image)
         self.assertGreater(image.info["pokemgr_capture_started_at"], started / 1e9)
         self.assertEqual(2, self.source._last_sequence)
+        self.assertEqual([call(1), call(2)], self.source.buffer.read.call_args_list)
+        self.assertEqual(2, self.source.clock.map_pts_us.call_count)
+        self.assertEqual(started + 15_000_000, self.now)
+
+    def test_rejected_sequence_is_not_consumed_by_a_timed_out_request(self):
+        self.source.buffer.latest_sequence = 1
+        self.source.buffer.read.return_value = self.frame(1, self.now - 1_000_000)
+        for _ in range(2):
+            with self.assertRaises(StreamCaptureTimeout):
+                self.source.capture(timeout=0.02)
+        self.assertEqual([call(1), call(1)], self.source.buffer.read.call_args_list)
+        self.assertEqual(0, self.source._last_sequence)
+
+    def test_raced_slot_waits_for_a_later_published_sequence(self):
+        started = self.now
+        new = self.frame(2, started + 3_000_000)
+        self.source.buffer.read.side_effect = lambda sequence: None if sequence == 1 else new
+        with patch.object(type(self.source.buffer), "latest_sequence",
+                          new_callable=PropertyMock, create=True) as latest:
+            latest.side_effect = [1, 1, 2]
+            self.assertIs(new.image, self.source.capture(timeout=0.02))
+        self.assertEqual([call(1), call(2)], self.source.buffer.read.call_args_list)
+
+    def _assert_barrier_interrupts_stale_wait(self, barrier):
+        self.source.buffer.latest_sequence = 1
+        self.source.buffer.read.return_value = self.frame(1, self.now - 1_000_000)
+
+        def interrupt_wait(seconds):
+            self.sleep(seconds)
+            barrier()
+
+        with patch("pokemgr.adb.stream_capture.time.sleep", side_effect=interrupt_wait):
+            with self.assertRaisesRegex(StreamCaptureTimeout, "invalidated"):
+                self.source.capture(timeout=0.1)
+        self.source.buffer.read.assert_called_once_with(1)
+        self.assertEqual(0, self.source._last_sequence)
+        self.assertEqual(-1, self.source._last_pts_us)
+
+    def test_pause_invalidates_even_when_latest_sequence_was_already_rejected(self):
+        self._assert_barrier_interrupts_stale_wait(self.source.invalidate)
+        self.assertTrue(self.source._pending_invalidation)
+
+    def test_input_invalidates_even_when_latest_sequence_was_already_rejected(self):
+        self._assert_barrier_interrupts_stale_wait(self.source.mark_input)
+        self.assertFalse(self.source._pending_invalidation)
+
+    def test_producer_identity_still_checked_while_waiting_after_rejected_sequence(self):
+        self.source.buffer.read.return_value = self.frame(1, self.now - 1_000_000)
+        with patch.object(type(self.source.buffer), "latest_sequence",
+                          new_callable=PropertyMock, create=True) as latest:
+            latest.side_effect = [1, FrameBufferError("Stream frame producer belongs to another session")]
+            with self.assertRaisesRegex(FrameBufferError, "another session"):
+                self.source.capture(timeout=0.02)
+        self.source.buffer.read.assert_called_once_with(1)
 
     def test_duplicate_pts_cannot_be_a_second_independent_frame(self):
         self.source._last_pts_us = self.now // 1000
         self.source.buffer.read.return_value = self.frame(2, self.now)
         self.assertIsNone(self.source._image(2, after_ns=self.now - 1_000_000))
+
+    # TRACEWEAVER: verifies=VER-SCAN-001; req=REQ-SCAN-003; trace=TRACE-SCAN-003
+    def test_image_carries_its_own_bounds_continuity_without_substituting_current_clock(self):
+        token = "b" * 32
+        self.source.clock.continuity_token = "c" * 32
+        self.source.clock.map_pts_us.side_effect = None
+        self.source.clock.map_pts_us.return_value = FrameTimeBounds(
+            self.now - 3000, self.now - 1000, 4, self.now + 10000, token,
+        )
+        self.source.buffer.read.return_value = self.frame(1, self.now - 3000)
+        image = self.source._image(1, after_ns=self.now - 10000)
+        self.assertEqual(token, image.info["pokemgr_source_clock_continuity"])
+        self.assertEqual(4, image.info["pokemgr_source_clock_generation"])
+        self.assertEqual((self.now - 3000) / 1e9, image.info["pokemgr_capture_started_at"])
+        self.assertEqual((self.now - 1000) / 1e9, image.info["pokemgr_capture_finished_at"])
+
+    def test_legacy_bounds_do_not_gain_a_continuity_token(self):
+        self.source.buffer.read.return_value = self.frame(1, self.now - 3000)
+        image = self.source._image(1, after_ns=self.now - 10000)
+        self.assertIsNone(image.info["pokemgr_source_clock_continuity"])
+
+    def test_continuity_token_cannot_override_input_or_frame_age_rejection(self):
+        for lower in (self.source._after_ns, self.now - 250_000_001):
+            with self.subTest(earliest_ns=lower):
+                self.source.clock.map_pts_us.side_effect = None
+                self.source.clock.map_pts_us.return_value = FrameTimeBounds(
+                    lower, self.now - 1000, 4, self.now + 10000, "b" * 32,
+                )
+                self.source.buffer.read.return_value = self.frame(1, self.now - 3000)
+                self.assertIsNone(self.source._image(1, after_ns=self.source._after_ns))
+                self.assertEqual(0, self.source._last_sequence)
 
     def test_input_barrier_and_oldest_possible_source_time_are_enforced(self):
         self.source.mark_input()

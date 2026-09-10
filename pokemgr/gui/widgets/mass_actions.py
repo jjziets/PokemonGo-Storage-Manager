@@ -110,7 +110,10 @@ class MassActions(QWidget):
 
         keep_layout.addStretch()
 
-        keep_desc = QLabel("Matches validated species/form, CP, HP and IVs; names may be nicknames.")
+        keep_desc = QLabel(
+            "Excludes existing favorites. Uses the same keeper scan as Decisions: "
+            "validated species/form, CP, HP and IVs; names may be nicknames."
+        )
         keep_desc.setWordWrap(True)
         keep_desc.setStyleSheet("color: #888;")
         keep_layout.addWidget(keep_desc)
@@ -233,10 +236,22 @@ class MassActions(QWidget):
         scrollbar.setValue(scrollbar.maximum())
 
     def on_finished(self, result: dict):
-        msg = ", ".join(f"{('would favorite' if k == 'favorited' and result.get('dry_run') else k)}: {v}"
-                        for k, v in result.items() if type(v) is int)
+        dry = result.get('dry_run', False)
+        labels = {'db_synced': 'favorite status saved',
+                  'db_unresolved': 'favorite status not saved'}
+        counts = []
+        for key, value in result.items():
+            if type(value) is not int or (dry and key in labels):
+                continue
+            label = labels.get(key, key)
+            if dry and key in ('favorited', 'unfavorited'):
+                label = 'would favorite' if key == 'favorited' else 'would unfavorite'
+            counts.append(f"{label}: {value}")
+        msg = ", ".join(counts)
         needs_review = any(type(result.get(key)) is int and result[key] > 0
                            for key in ('unmatched', 'ambiguous', 'unresolved'))
+        needs_review = needs_review or (not dry and type(result.get('db_unresolved')) is int
+                                        and result['db_unresolved'] > 0)
         if result.get('error'):
             title, color = f"Failed — {result['error']}", "#f88"
         elif result.get('aborted'):

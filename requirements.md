@@ -17,6 +17,7 @@ Baseline semantic SHA256: `4b966981a29f704128139ccb4c85dfd6dcdbd456e08911d06a2b4
 - Operations: apply improved scanning to Mass Actions and Decisions; add process CPU/GPU usage, showing unavailable readings honestly.
 - Keep selection: retain highest CP alongside best IV/PvP, and “We should also favor all perfect IVs”.
 - Publication: “commit/pr and merge”. Target resolved from the repository's sole/default branch: `dev` at `jjziets/PokemonGo-Storage-Manager`; implementation branch `codex/stream-scanning-and-keepers`.
+- September10 follow-up: “nice lets udpate the app and then commit and push” authorizes the fixed app canvas and accumulated requested fixes on the current `dev` branch. The prior publication target is retained as history in the intent contract. The scan is running: this work must not interact with the phone, restart the app or modify production data. Cross-device layout reuse remains subject to matching resolution/DPI and device-specific verification.
 
 ## Requirements
 

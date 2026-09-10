@@ -144,6 +144,7 @@ class StreamResourceCleanupTests(unittest.TestCase):
                 worker = Mock()
                 worker.isRunning.return_value = True
                 window = SimpleNamespace(adb=Mock(), statusBar=Mock(return_value=Mock()),
+                                         _refresh_collection=Mock(), _refresh_decisions=Mock(),
                                          **{attribute: worker, tab: Mock()})
                 window.adb.has_stream_frames = True
                 setattr(window, poll.__name__, lambda owner=None: poll(window, owner))
@@ -156,6 +157,8 @@ class StreamResourceCleanupTests(unittest.TestCase):
                 worker.terminate.assert_not_called()
                 worker.wait.assert_not_called()
                 window.adb.close_stream_capture.assert_not_called()
+                window._refresh_collection.assert_not_called()
+                window._refresh_decisions.assert_not_called()
                 controls = getattr(window, tab)
                 getattr(controls, setter).assert_not_called()
                 getattr(controls, label).setText.assert_called_with("Stopping...")
@@ -169,6 +172,8 @@ class StreamResourceCleanupTests(unittest.TestCase):
                      patch('pokemgr.gui.main_window.QMessageBox.information'):
                     poll(window, worker)
                 timer.assert_not_called()
+                window._refresh_collection.assert_called_once()
+                window._refresh_decisions.assert_called_once()
                 if attribute == '_mass_worker':
                     controls.on_finished.assert_called_once_with({'aborted': True})
                 else:

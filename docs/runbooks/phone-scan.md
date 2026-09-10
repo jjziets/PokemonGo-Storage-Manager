@@ -53,6 +53,25 @@ must include **App-only stream**. Screenshots, taps, keyboard input and game
 launches all target that same display. The scanner stops if its display is
 removed or recreated; it must not fall back to tapping the phone's main screen.
 
+The default app canvas is **968 × 2376 pixels at 420 DPI**, including on tablets.
+Both pixel dimensions and density are fixed so the game uses the same portrait
+phone layout. Encoder failure does not silently reduce the resolution, and the
+manager rejects a display whose actual size or DPI differs from the request.
+For an explicit device-native layout instead, launch with `--native-display`;
+that layout needs its own matching coordinates.
+
+Calibration files now distinguish DPI as well as device and resolution. An
+existing device profile takes precedence. On a new device, compatible saved
+coordinates can be reused when their resolution, DPI and layout agree. Conflicting
+preferred coordinate sets are not guessed. Reused profiles retain the new
+device identity, start unverified, and use its default swipe timing; another
+device's validation evidence is never copied. Check a short appraisal sample
+before a long first scan. Legacy files remain readable when all their recorded
+geometry matches, and lookup does not rewrite them.
+
+Installing these changes does not alter an active stream. Use the new layout
+on the next launch after the current scan has finished.
+
 Keep both windows open while scanning. Closing either ends this paired session
 and moves the game back to the phone. Click **Turn phone screen on** beside
 **Connect** whenever you want to see the physical phone display; the game
@@ -69,6 +88,22 @@ opening a normal whole-phone mirror is therefore insufficient for dark-screen
 scanning on this device.
 
 ### Stream frame capture and native Mac OCR
+
+The live preview uses a 50ms display buffer to smooth small delivery gaps.
+Scanner frames come directly from the decoder and bypass that buffer. The
+scanner also avoids repeatedly copying the same rejected stale frame while
+waiting for a newer one. Neither change invents frames when the phone stops
+producing them. The native Mac exporter marks the active stream as
+user-requested work so macOS can keep processing frames in the background.
+The activity ends when the stream closes and still permits normal Mac sleep.
+It does not change global power settings or keep the Mac display lit.
+
+The stream is capped at 30 FPS, so it can look less fluid than a 60 FPS phone
+display even with steady delivery. Source timestamps alone cannot locate a
+stall: compare them with arrival times before blaming the phone. Controlled
+tests found sustained delivery backlog in the Mac preview path and greatly
+reduced it with the activity marker; occasional short pauses remained. See the
+[background scheduling evidence](../reviews/2026-09-10-stream-background-scheduling.md).
 
 The default launcher now reads the existing app video stream directly. It
 builds a project-local scrcpy client and keeps the latest 30 decoded frames in
@@ -94,8 +129,12 @@ the candy name is never copied into the species field.
 The bottom status bar shows CPU and resident memory for the manager and its
 attributable OCR, ADB, and paired stream processes. Hover over it for each
 process's counters. Sampling runs off the UI thread every two seconds, with
-100% CPU meaning one core. GPU reads **unavailable**: per-process GPU profiling
-on this Mac requires privileges that the manager does not request. Shared
+100% CPU meaning one core. GPU reads **usage not measured**: the monitor does
+not collect GPU counters, so this says nothing about whether acceleration is
+active. Apple's `powermetrics` profiler requires administrator access; this app
+does not run it, and running the manager as administrator would not add that
+integration. For a view of the Mac's overall GPU activity, open Activity Monitor
+and choose **Window > GPU History**. Shared
 memory pages may appear in more than one process's resident memory total.
 
 Scanning still starts with HP and IVs. A unique calculated CP needs two
@@ -149,7 +188,49 @@ require an exact species/form, CP, HP, IV and category match to the database.
 Nicknames are not matching keys. Unresolved forms or conflicting keeper
 records remain unmatched for review.
 
-Searches stay unchanged when a star changes. Unfavorite therefore traverses
+Keeper searches include only CP values required by eligible unstarred keeper
+records, split into disjoint groups below the full search reader's length
+limit. CP values belonging only to recorded favorites or nonkeepers are left
+out. The query also includes `!favorite`, so already-starred Pokemon sharing
+a pending CP are excluded on the phone. Only eligible unstarred records add
+to the action budget. Filtering narrows candidates without replacing the live
+species/form, HP, IV and CP checks.
+
+Because adding a star changes `!favorite` membership, keeper actions use
+bounded traversals. After confirmed changes, the executor re-enters the full
+verified search and requires the result count to decrease by exactly the
+number of confirmed OFF-to-ON changes. It checks this even after the final
+target is favorited. A fresh traversal starts from the top, so neighbors missed
+as the list shrinks remain available. Old backtracking evidence is discarded;
+an already-ON retained card cannot consume another keeper or update a duplicate
+database record. A complete traversal with no changes ends the batch with any
+remaining matches reported. An incomplete traversal with no changes holds.
+
+Exact weight and height are not stored in existing collection records;
+live size/sex evidence helps prove movement but does not replace a saved
+keeper's CP. The power-up preview remains a read-only fallback when HP/IV
+calculation and visible CP cannot resolve the appraisal.
+
+The keeper confirmation counts database records: total KEEP equals recorded
+favorites plus recorded unstarred keepers. It breaks the unstarred count into
+eligible and held records using the executor's same occurrence guards.
+Eligibility is before selected-pass and live checks; it is not a promised
+number of star taps. Recorded favorite state may differ from the phone, and
+repeat scans can produce multiple records for an indistinguishable specimen.
+
+Before moving on, a disagreeing completed-position read is retried without
+repeating the star action or consuming another keeper. Recovery needs two
+fresh matching reads with settled bars within three attempts; persistent
+disagreement saves comparison images under `cache/scan_failures/`. A changed
+nonfavorite list may refresh after a pre-input or navigation hold; an uncertain
+post-tap outcome still stops without another tap.
+
+A confirmed gym defender whose appraisal hides HP can be skipped after two
+independent matching species/IV observations and settled pixels/bars. This
+skip cannot authorize a keeper favorite or a database identity. Missing HP
+on an ordinary appraisal still holds rather than accepting an incomplete read.
+
+Category action searches stay unchanged when a star changes. Unfavorite traverses
 all storage with `cp0-`, including already-unstarred entries. An empty search
 shows the game's suggestion tiles, so it is never used for an action pass.
 Identical-stat neighbors are
@@ -477,20 +558,62 @@ The verified Fold6 profile owns the 300 ms
 carousel swipe duration; model rotations use a separate short, slow gesture.
 Speed Tuning displays that calibrated carousel duration without overriding it.
 
+Gym defenders show a **GO TO GYM** button instead of full HP, and their visible
+CP reflects gym motivation. The scanner excludes that CP from normal storage
+calculation. It confirms the gym indicator, caught species, name, IVs and
+stable appraisal pixels on another fresh frame, preserves or verifies the
+favorite star, and counts one skipped position before continuing. It does not
+save an invented HP or CP value. Gym detection alone cannot authorize a skip
+when the appraisal identity or favorite state cannot be confirmed.
+Pausing a gym review waits locally and rereads the same identity on resume.
+Once a star tap may have been sent, only readback is retried; it never toggles
+again. Each review/readback phase retains a three-read limit.
+During an active raid, the game replaces the gym button with a message saying
+the Pokemon will return to the gym when the raid ends. Native OCR recognizes
+that complete message in its expected screen region from the same frame and
+uses the same gym review path, without treating the reduced CP as storage CP.
+
 ### A forward swipe that does not confirm the next Pokemon
 
-If a forward swipe still shows the last accepted tuple, the scanner may make
-one bounded recovery attempt. It must first reverse to the distinct previous
+If a forward swipe still shows the last accepted species/CP/HP/IV tuple, the
+scanner first checks weight, height, sex and catch date for a distinct specimen.
+It requires two independent settled captures before the swipe and two after:
+all four must validate that complete tuple, while at least one confident detail
+must agree within each side and differ across it. Missing or noisy details do
+not count as differences. Native accurate OCR is requested only for this rare
+fallback; ordinary different-stat transitions keep the existing fast path.
+Compatible periodic clock refinements preserve this comparison through a
+separate clock-continuity token and ordered source/capture times. Actual clock
+invalidation, a new clock instance or expired coverage still discards it.
+These details prove adjacent positions, not a permanent unique Pokemon ID.
+Separate identical-stat individuals remain separate stored rows.
+
+If those details cannot prove the move, the scanner may make one bounded
+recovery attempt. It must first reverse to the distinct previous
 accepted checkpoint, then move forward and verify that the last accepted
 checkpoint has been restored. Only after both exact checks pass does it retry
 the forward swipe once and require a verified next appraisal. Probe reads do
 not add database rows.
 
+Each checkpoint allows up to three fresh acquisition attempts before a
+persistent mismatch stops recovery. A delayed swipe response can therefore
+settle on the expected checkpoint without repeating the carousel gesture.
+The error and log record the expected and observed species, CP, HP and IVs.
+Specimen rejections log which guard failed and the relevant source/details.
+Pausing an
+invalidated confirmation retains the current recovery phase; resuming rereads
+that phase instead of repeating its swipe. Invalid or unrecognized screens
+still stop recovery immediately.
+
 There is no blind extra swipe. Missing checkpoints, a mismatched restore, an
 abort or an unverified retry stops the scan. Identical adjacent species/CP/HP/IV
-tuples remain ambiguous without observed motion or distinct checkpoint proof;
+tuples remain ambiguous without distinct specimen details, observed motion or checkpoint proof;
 an unchanged tuple alone cannot establish whether the swipe failed or reached
 another identical Pokemon.
+
+This position error does not enter the favorite-and-skip path. That path needs
+a verified new position; otherwise it could favorite an already saved Pokemon
+and count a skipped occurrence that did not exist. Saved rows remain intact.
 
 ### What checked scan-pass boxes mean
 
@@ -499,6 +622,29 @@ mean “look for this label inside every already-open Pokemon.” For example,
 checking **Shiny** runs a shiny-filtered pass. The **Normal** pass excludes
 categories that have their own checked pass, so the same category is not meant
 to be scanned twice. **Max per pass** applies separately to every checked pass.
+
+Other checked categories can overlap each other: a shiny Shadow can match both
+passes. The supervised full-inventory run therefore uses the fifteen disjoint
+partitions recorded in `cache/scan-supervision/state.json` after Normal. Once
+Normal is explicitly completed, its active session is sealed and cleared, and
+all previously run partitions are reconciled, close the stopped manager/stream
+and launch the pending queue:
+
+```bash
+.venv/bin/python scripts/stream_pokemon.py --scan-queue cache/scan-supervision/state.json
+```
+
+The queue preserves existing rows/stars, clears resume/cap settings and keeps
+Pause/Stop available. It refuses partial or active partition records and never
+replays them automatically. Retain all fifteen partition records, including
+completed ones, so the loader can check complete, non-overlapping coverage.
+Do not launch a second manager while a scanner owns the phone.
+
+Each filter requires exact full search-text verification and two independent
+agreeing storage-count reads. An explicit zero continues to the next partition;
+an unreadable count holds before opening a Pokemon. Saved rows and verified
+skips are counted separately. The supervisor reconciles log/session evidence
+back into the ledger; the queue does not mark ledger entries complete itself.
 
 For calibration, check **Normal** only, uncheck Shiny/Shadow/Lucky/Dynamax/
 Gigantamax/Custom, and set **Max per pass** to `2`.
@@ -622,6 +768,27 @@ This records the known truth in both the manifest and profile. It does not make
 a profile portable to another display mode or resolution.
 
 ## 9. Finish or recover
+
+The settling check compares the IV bars themselves as well as the surrounding
+appraisal. Moving fill edges or the orange-to-pink maximum animation require
+another frame; there is no additional fixed delay on every Pokemon. If only
+IVs change before recovery sends any input, a witnessed position can discard
+that acquisition and retry within its three-attempt budget. Two new independent
+frames must agree before CP validation resumes. Changed species, HP, sex or
+other identity evidence, uncertain navigation and exhausted conflicts still
+stop for inspection.
+
+For Nidoran, ambiguous caught-text readings of its sex symbol require a clear
+male/female icon on that same appraisal frame. Editable names and fuzzy species
+suggestions do not choose its sex. Missing or contradictory evidence remains
+unresolved.
+
+Caught-name case, whitespace or trailing-quote differences can be retried three
+times for review when HP, IVs, gender, form text and the settled appraisal all
+agree. This fallback only favorites and skips a confirmed position; it never
+supplies CP or stores a row. Once the star may have been tapped, retries and
+pause/resume only verify it, without another toggle. Changed stats or uncertain
+navigation still stop for inspection.
 
 For a successful gate, increase the limit gradually before a full scan. Keep
 the first longer run attended.

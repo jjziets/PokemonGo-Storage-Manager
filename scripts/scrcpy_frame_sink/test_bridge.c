@@ -1,4 +1,5 @@
 /* Offline fixture bridge; never linked into the client. */
+/* TRACEWEAVER: file-role=native-stream-test-bridge; verifies=VER-STREAM-ACTIVITY-001; req=REQ-STREAM-001; trace=TRACE-STREAM-001 */
 #include "pokemgr_frame_sink.h"
 #include <libavutil/frame.h>
 #include <stdlib.h>
@@ -8,6 +9,24 @@ struct fixture {
     struct sc_pk_frame_sink sink;
     AVFrame *frame;
 };
+
+void *
+pk_test_init_only(const char *path, const char *nonce) {
+    struct fixture *f = calloc(1, sizeof(*f));
+    if (!f) return NULL;
+    if (!sc_pk_frame_sink_init(&f->sink, path, nonce)) {
+        sc_pk_frame_sink_destroy(&f->sink);
+        free(f);
+        return NULL;
+    }
+    return f;
+}
+
+void
+pk_test_close(void *handle) {
+    struct fixture *f = handle;
+    f->sink.frame_sink.ops->close(&f->sink.frame_sink);
+}
 
 void *
 pk_test_create(const char *path, int width, int height, int rgb) {

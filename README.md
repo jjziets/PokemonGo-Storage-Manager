@@ -99,18 +99,20 @@ every suggested transfer is unnecessary.
 ### Execution
 
 After reviewing decisions in the GUI, the executor:
-1. Verifies the complete in-game search filter before opening its results.
+1. Narrows each keeper pass to pending CP values and excludes existing favorites with `!favorite`, then verifies the complete in-game search filter.
 2. Reads stable appraisal evidence through the shared scanner.
 3. Matches exact species/form, CP, HP, IVs and category flags against keeper occurrences.
 4. Checks identity and the observed star, toggles once when needed, and verifies the result.
-5. Reports unmatched, ambiguous, stopped and failed results for review. It never transfers Pokemon.
+5. Refreshes the remaining results after changes, verifying that the count decreased by exactly the confirmed favorites. Confirmed gym defenders with hidden HP are skipped without changing their stars.
+6. Reports unmatched, ambiguous, stopped and failed results for review. It never transfers Pokemon.
 
 ## Features
 
 - **Multi-pass scanning** with configurable search filters (Normal, Shiny, Shadow, Lucky, Dynamax, Gigantamax, Custom)
 - **Shared frame OCR** — native macOS Vision on the app stream, with Tesseract and optional PaddleOCR paths
+- **Consistent app layout** — app streams use 968 × 2376 at 420 DPI on phones and tablets; matching coordinates can be reused while device verification stays separate
 - **App-only stream** — a local scrcpy client exports a bounded 30-frame buffer; UI controls turn the physical phone screen on or off
-- **Process monitoring** — CPU and RSS for the manager and verified helpers; GPU usage is labeled unavailable when it cannot be measured
+- **Process monitoring** — CPU and RSS for the manager and verified helpers; GPU usage is labeled not measured, independently of whether GPU acceleration is active
 - **Fingerprint validation** — Every Pokemon verified against the CP formula before storing
 - **PvP IV rankings** — Computed from PvPoke gamemaster.json for all leagues
 - **Desktop GUI** (PySide6/Qt) with dark theme, live scan progress, collection browser with sorting/filtering, decision review with drag-and-drop

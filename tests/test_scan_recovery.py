@@ -187,6 +187,7 @@ class StructuredTransitionRecoveryTests(unittest.TestCase):
             side_effect=[transient, pokemon_a, pokemon_a]
         )
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
         sm._read_appraisal_snapshot = Mock(return_value=({}, {}))
 
@@ -215,6 +216,7 @@ class StructuredTransitionRecoveryTests(unittest.TestCase):
             side_effect=[transient, pokemon_a, pokemon_a]
         )
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
 
         frame, status = sm._wait_for_stable_appraisal(
@@ -233,6 +235,7 @@ class StructuredTransitionRecoveryTests(unittest.TestCase):
         pokemon_a = Image.new("RGB", (968, 2376), "white")
         sm._fast_screencap = Mock(side_effect=[pokemon_a] * 7)
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
 
         frame, status = sm._wait_for_stable_appraisal(
@@ -251,6 +254,7 @@ class StructuredTransitionRecoveryTests(unittest.TestCase):
         pokemon_a = Image.new("RGB", (968, 2376), "white")
         sm._fast_screencap = Mock(side_effect=[pokemon_a] * 7)
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
 
         frame, status = sm._wait_for_stable_appraisal(
@@ -278,6 +282,7 @@ class StructuredTransitionRecoveryTests(unittest.TestCase):
         )
         sm._fast_screencap = Mock(return_value=confirmation)
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
         sm._read_appraisal_snapshot = Mock(side_effect=[({}, {}), ({}, {})])
 
@@ -315,6 +320,7 @@ class StructuredTransitionRecoveryTests(unittest.TestCase):
         )
         sm._fast_screencap = Mock(return_value=frame.copy())
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
         sm._read_appraisal_snapshot = Mock(side_effect=[({}, {}), ({}, {})])
 
@@ -344,6 +350,7 @@ class StructuredTransitionRecoveryTests(unittest.TestCase):
             side_effect=[black, red, black, red, black, red, black]
         )
         sm.reader.are_bars_visible = Mock(return_value=True)
+        sm.reader.appraisal_bars_stable = Mock(return_value=True)
         sm.nav.detect_screen = Mock(return_value="appraisal")
 
         frame, status = sm._wait_for_stable_appraisal(

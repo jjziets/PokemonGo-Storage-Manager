@@ -308,6 +308,25 @@ class PokemonDatabase:
         )
         self._maybe_commit()
 
+    def update_favorited_many(self, pokemon_ids, favorited: bool):
+        """Commit one confirmed star observation/group before further input."""
+        ids = list(dict.fromkeys(pokemon_ids))
+        if not ids:
+            return
+        self.flush()
+        try:
+            with self.conn:
+                for pokemon_id in ids:
+                    cursor = self.conn.execute(
+                        "UPDATE pokemon SET favorited = ? WHERE id = ?",
+                        (int(favorited), pokemon_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(f"Stored Pokemon {pokemon_id} no longer exists")
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def clear_decisions(self, session_id: str | None = None):
         if session_id:
             self.conn.execute(

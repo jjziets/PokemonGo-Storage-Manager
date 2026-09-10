@@ -3,8 +3,8 @@
 CPU is delta(user + system time) / monotonic elapsed time: 100% is one CPU core.
 RSS is resident memory, not unique memory or Activity Monitor's footprint.
 No shell subprocess, ADB call, privileged profiler, or device-wide GPU estimate
-is used. macOS Metal counters cannot observe these processes' opaque command
-buffers; powermetrics --show-process-gpu requires privileged profiling.
+is used. This monitor does not collect GPU counters. Apple's powermetrics
+requires administrator access; elevation alone does not add that integration.
 """
 
 from dataclasses import dataclass
@@ -29,7 +29,8 @@ except ImportError:
 
 
 GPU_UNAVAILABLE = (
-    "macOS does not expose per-process GPU usage to this app without privileged profiling."
+    "This monitor does not measure per-process GPU usage. GPU acceleration can still be active. "
+    "Apple's powermetrics profiler requires administrator access; this app does not run it."
 )
 
 
@@ -195,7 +196,7 @@ def resource_text(snapshot):
            if measured else "unavailable" if not rows or any(row.state for row in rows) else "measuring")
     memory_ready = bool(rows) and all(row.rss_bytes is not None for row in rows)
     memory = _memory(sum(row.rss_bytes for row in rows)) if memory_ready else "unavailable"
-    summary = f"App + helpers: CPU {cpu} · RAM {memory} · GPU unavailable"
+    summary = f"App + helpers: CPU {cpu} · RAM {memory} · GPU usage not measured"
     details = ["<b>App and verified helpers</b><table>",
                "<tr><th align='left'>Process</th><th>PID</th><th>CPU</th><th>RAM (RSS)</th></tr>"]
     for row in rows:
@@ -207,7 +208,7 @@ def resource_text(snapshot):
                    "<br>A partial CPU total excludes processes still measuring or unavailable."
                    "<br>RAM is resident memory (RSS); shared pages can appear in more than one process."
                    "<br>Short-lived helpers may finish between samples.</p>")
-    details.append(f"<p>GPU unavailable: {html.escape(snapshot.gpu_reason)}</p>")
+    details.append(f"<p>GPU usage not measured: {html.escape(snapshot.gpu_reason)}</p>")
     if snapshot.note:
         details.append(f"<p>{html.escape(snapshot.note)}</p>")
     return summary, "".join(details)

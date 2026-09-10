@@ -12,6 +12,12 @@ PROJECT_ROOT = Path(__file__).parent.parent
 # ADB
 ADB_PATH = os.environ.get("ADB_PATH", "/opt/homebrew/bin/adb")
 
+# Fixed app canvas shared by Android phones and tablets. DPI is part of the
+# layout: identical pixels with a different density can trigger tablet UI.
+STANDARD_STREAM_WIDTH = 968
+STANDARD_STREAM_HEIGHT = 2376
+STANDARD_STREAM_DENSITY = 420
+
 # Directories
 CALIBRATIONS_DIR = PROJECT_ROOT / "calibrations"
 DATA_DIR = PROJECT_ROOT / "data"

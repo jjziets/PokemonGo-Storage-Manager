@@ -41,13 +41,48 @@ def pokemon(read=None, **changes):
     ) | changes))
 
 
+# TRACEWEAVER: entrypoint=KeeperFavoritePlanTests; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
+class KeeperFavoritePlanTests(unittest.TestCase):
+    def test_pending_counts_exclude_starred_neighbors_and_preserve_all_ambiguity_guards(self):
+        rows = [
+            pokemon(favorited=True), pokemon(), pokemon(),
+            pokemon(cp=501), pokemon(cp=501, scan_session_id="rescan", favorited=True),
+            pokemon(cp=502), pokemon(cp=502, decision="TRANSFER"),
+            pokemon(hp=0), pokemon(cp=503, shiny=True),
+        ]
+
+        plan = Executor.plan_keeper_favorites(rows)
+
+        self.assertEqual((8, 2, 6, 3, 3),
+                         (plan.total, plan.already_favorited, plan.unstarred,
+                          plan.ambiguous, plan.eligible))
+        self.assertEqual({Executor._keeper_key(rows[0]): 2, Executor._keeper_key(rows[-1]): 1},
+                         plan.remaining)
+        # Execution may consume occurrences; a new preview must be independent.
+        plan.remaining.clear()
+        self.assertEqual(3, sum(Executor.plan_keeper_favorites(rows).remaining.values()))
+
+    def test_empty_all_starred_and_all_held_counts(self):
+        for rows, expected in (([], (0, 0, 0, 0)),
+                               ([pokemon(decision="TRANSFER")], (0, 0, 0, 0)),
+                               ([pokemon(favorited=True)], (1, 1, 0, 0)),
+                               ([pokemon(hp=0)], (1, 0, 1, 0))):
+            with self.subTest(expected=expected):
+                plan = Executor.plan_keeper_favorites(rows)
+                self.assertEqual(expected, (plan.total, plan.already_favorited,
+                                            plan.ambiguous, plan.eligible))
+                self.assertFalse(plan.remaining)
+
+
 class MassActionScanningTests(unittest.TestCase):
     def setUp(self):
         profile = CalibrationProfile("test", "serial", "968x2376", 420,
                                      ScreenRegions.default_for_resolution(968, 2376, density=420))
         self.adb, self.db = Mock(), Mock()
+        self.db.get_all.return_value = []
         self.executor = Executor(self.adb, profile, self.db)
         self.scanner = self.executor._scanner
+        self.scanner._save_failed_appraisal = Mock()
         self.reader = self.executor.reader
         self.reader.prepare_native_ocr = Mock()
         self.reader.read_cp = Mock(side_effect=AssertionError("Category action must not read CP"))
@@ -92,7 +127,7 @@ class MassActionScanningTests(unittest.TestCase):
         self.assertEqual(8, self.scanner._read_appraisal_snapshot.call_count)
         self.executor._advance_action.assert_called_once()
         self.reader.read_cp.assert_not_called()
-        self.executor._open_pass.assert_called_once_with("shiny")
+        self.executor._open_pass.assert_called_once_with("shiny", verify_count=True)
 
     def test_five_identical_tuples_remain_five_verified_positions(self):
         self.setup_positions([snapshot()] * 5)
@@ -109,13 +144,13 @@ class MassActionScanningTests(unittest.TestCase):
 
         self.assertNotIn("error", result)
         self.assertEqual((2, 1), (result["checked"], result["unfavorited"]))
-        self.executor._open_pass.assert_called_once_with("cp0-")
+        self.executor._open_pass.assert_called_once_with("cp0-", verify_count=True)
         self.adb.tap.assert_called_once()
         self.reader.read_cp.assert_not_called()
 
     def test_changed_hp_before_star_stops_without_count_or_blind_swipe(self):
         self.setup_positions([snapshot()])
-        self.scanner._fast_screencap.side_effect = [frame(snapshot(hp=61))]
+        self.scanner._fast_screencap.side_effect = [frame(snapshot(hp=61)) for _ in range(3)]
 
         result = self.executor.favorite_by_filter("shiny")
 
@@ -126,7 +161,7 @@ class MassActionScanningTests(unittest.TestCase):
 
     def test_unknown_star_does_not_default_to_off(self):
         self.setup_positions([snapshot()])
-        self.scanner._fast_screencap.side_effect = [frame(snapshot(), "unknown")] * 3
+        self.scanner._fast_screencap.side_effect = [frame(snapshot(), "unknown") for _ in range(3)]
 
         result = self.executor.favorite_by_filter("shiny")
 
@@ -184,18 +219,19 @@ class MassActionScanningTests(unittest.TestCase):
         for changes in ({"cp": 501}, {"shiny": True}, {"shadow": True}, {"lucky": True}, {"is_dynamax": True}):
             self.assertNotEqual(key, self.executor._snapshot_keeper_key(snapshot(**changes)))
 
-    def test_keeper_multiset_includes_already_favorite_identical_occurrence(self):
+    def test_keeper_multiset_excludes_already_favorite_identical_occurrence(self):
         self.db.get_all.return_value = [pokemon(favorited=True), pokemon()]
         observed = []
         def run(_query, remaining, *_args, **_kwargs):
             observed.append(dict(remaining))
             remaining.clear()
-            return {"favorited": 1, "checked": 2}
+            self.assertIn("!favorite", _query.split("&"))
+            return {"favorited": 1, "checked": 1}
         self.executor._run_favorite_pass = Mock(side_effect=run)
 
         result = self.executor.favorite_keepers(selected_passes=["Normal"])
 
-        self.assertEqual([2], list(observed[0].values()))
+        self.assertEqual([1], list(observed[0].values()))
         self.assertEqual(0, result["unmatched"])
 
     def test_keeper_pass_does_not_finish_at_already_starred_identical_neighbor(self):
@@ -424,6 +460,16 @@ class MassActionScanningTests(unittest.TestCase):
         self.assertEqual(2, self.executor.nav.navigate_to_storage.call_count)
         self.assertEqual(2, self.executor.nav.enter_search.call_count)
         self.executor.nav.tap_first_pokemon.assert_not_called()
+
+    def test_action_search_can_observe_pause_even_after_resume(self):
+        generation = self.executor.nav._observation_generation()
+
+        self.executor.pause()
+
+        self.assertTrue(self.executor.nav.is_cancelled())
+        self.executor.resume()
+        self.assertFalse(self.executor.nav.is_cancelled())
+        self.assertNotEqual(generation, self.executor.nav._observation_generation())
 
     def test_favorite_dependent_query_is_rejected_before_navigation(self):
         self.executor.nav.navigate_to_storage = Mock()

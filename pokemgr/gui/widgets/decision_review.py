@@ -58,7 +58,8 @@ class DecisionReview(QWidget):
             "QPushButton { background-color: #4a5a2a; padding: 6px 12px; font-weight: bold; }"
         )
         self.approve_btn.setToolTip(
-            "Dry run: read appraisal HP and IVs first, then verify species/form, CP and flags "
+            "Dry run: exclude existing favorites on the phone. Read appraisal HP and IVs first, "
+            "then verify species/form, CP and flags "
             "against stored keeper stats. Nicknames do not determine matches."
         )
         top_bar.addWidget(self.approve_btn)
@@ -68,7 +69,8 @@ class DecisionReview(QWidget):
             "QPushButton { background-color: #7a6a2a; padding: 6px 12px; font-weight: bold; }"
         )
         self.favorite_real_btn.setToolTip(
-            "Read appraisal HP and IVs first, then favorite only keepers whose species/form, "
+            "Exclude existing favorites on the phone. Read appraisal HP and IVs first, "
+            "then favorite only keepers whose species/form, "
             "CP and flags match the stored stats. Nicknames do not determine matches."
         )
         top_bar.addWidget(self.favorite_real_btn)
@@ -438,16 +440,20 @@ class DecisionReview(QWidget):
     def on_fav_finished(self, result: dict):
         """Keep the actual outcome visible after the worker has released resources."""
         dry = self._fav_dry_run or result.get("dry_run", False)
+        labels = {"db_synced": "favorite status saved",
+                  "db_unresolved": "favorite status not saved"}
         counts = []
         for key, value in result.items():
-            if type(value) is not int:
+            if type(value) is not int or (dry and key in labels):
                 continue
-            label = key.replace("_", " ")
+            label = labels.get(key, key.replace("_", " "))
             if dry and key in ("favorited", "unfavorited"):
                 label = "would favorite" if key == "favorited" else "would unfavorite"
             counts.append(f"{label}: {value}")
         needs_review = any(type(result.get(key)) is int and result[key] > 0
                            for key in ("unmatched", "ambiguous", "unresolved"))
+        needs_review = needs_review or (not dry and type(result.get("db_unresolved")) is int
+                                        and result["db_unresolved"] > 0)
         if "error" in result and result["error"] is not None:
             error = result["error"] or "The action failed without an error message"
             title = f"{'Dry run failed' if dry else 'Failed'} — {error}"

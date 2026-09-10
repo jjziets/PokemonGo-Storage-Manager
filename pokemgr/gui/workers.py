@@ -1,3 +1,5 @@
+# TRACEWEAVER: file-role=scan-worker-queue-controls; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+# TRACEWEAVER: entrypoint=ScanWorker.run; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 """Background workers for ADB operations (run in QThread to keep GUI responsive)."""
 
 import logging
@@ -20,6 +22,8 @@ log = logging.getLogger(__name__)
 class ScanWorker(QThread):
     """Multi-pass scan: runs filtered passes (normal, shiny, shadow, dynamax, gmax)."""
 
+    # TRACEWEAVER: entrypoint=ScanWorker; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+
     progress = Signal(int, object)
     pass_count = Signal(int)
     status = Signal(str)
@@ -39,15 +43,25 @@ class ScanWorker(QThread):
         self.max_pokemon = max_pokemon
         self.selected_passes: list[dict] | None = None  # set by main window
         self._scanner: MultiPassScanner | None = None
+        self._control_lock = threading.RLock()
         self._abort_requested = False
+        self._pause_requested = False
 
     def run(self):
         try:
             ensure_dirs()
-            if self._abort_requested:
-                return
+            with self._control_lock:
+                if self._abort_requested:
+                    return
 
-            self._scanner = MultiPassScanner(self.adb, self.profile, self.db)
+            scanner = MultiPassScanner(self.adb, self.profile, self.db)
+            with self._control_lock:
+                self._scanner = scanner
+                if self._abort_requested:
+                    scanner.abort()
+                    return
+                if self._pause_requested:
+                    scanner.pause()
             self._scanner.unfavorite_all = self.unfavorite
             if self.max_pokemon > 0:
                 self._scanner.max_per_pass = self.max_pokemon
@@ -60,7 +74,9 @@ class ScanWorker(QThread):
                      self._scanner.resume_target_species, self._scanner.resume_target_cp)
 
             # Use selected passes if provided
-            if self.selected_passes:
+            if self.selected_passes is not None:
+                if not self.selected_passes:
+                    raise ValueError("Explicit scan queue is empty; no default passes started")
                 from ..indexer.multi_pass import ScanPass
                 self._scanner.passes = [
                     ScanPass(name=p["name"], search_query=p["query"], tags=p["tags"])
@@ -78,9 +94,15 @@ class ScanWorker(QThread):
             )
             self._scanner.on_error = lambda m: self.error.emit(m)
 
+            with self._control_lock:
+                if self._abort_requested:
+                    return
+            # The scanner is already attached: a control request after this
+            # check is forwarded before its first navigation boundary.
             self._scanner.start()
-            if not self._abort_requested:
-                self.finished.emit(self._scanner._total_count)
+            with self._control_lock:
+                if not self._abort_requested:
+                    self.finished.emit(self._scanner._total_count)
 
         except Exception as e:
             log.exception("Scan worker error")
@@ -89,18 +111,28 @@ class ScanWorker(QThread):
             self.failed.emit(message)
 
     def pause(self):
-        if self._scanner and self._scanner._current_sm:
-            self._scanner._current_sm.pause()
+        with self._control_lock:
+            if self._abort_requested:
+                return
+            self._pause_requested = True
+            if self._scanner is not None:
+                self._scanner.pause()
 
     def resume(self):
-        if self._scanner and self._scanner._current_sm:
-            self._scanner._current_sm.resume()
+        with self._control_lock:
+            if self._abort_requested:
+                return
+            self._pause_requested = False
+            if self._scanner is not None:
+                self._scanner.resume()
 
     def abort(self):
         """Force stop — sets abort flag on scanner AND current state machine."""
-        self._abort_requested = True
-        if self._scanner:
-            self._scanner.abort()
+        with self._control_lock:
+            self._abort_requested = True
+            self._pause_requested = False
+            if self._scanner is not None:
+                self._scanner.abort()
 
 
 class ScanFromCurrentWorker(QThread):

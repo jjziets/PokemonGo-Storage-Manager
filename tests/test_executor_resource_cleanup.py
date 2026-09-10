@@ -52,6 +52,7 @@ class ExecutorResourceCleanupTests(unittest.TestCase):
     def test_abort_closes_reader_without_running_a_pass(self):
         self.executor.db.get_all.return_value = [SimpleNamespace(
             decision="KEEP", favorited=False, species="Dragonite", atk=15, def_=15, sta=15, hp=188,
+            cp=4137, shiny=False, shadow=False, lucky=False, is_dynamax=False,
         )]
         self.executor.abort()
         with patch.object(self.executor, "_write_log"), patch.object(self.executor, "_run_favorite_pass") as run:

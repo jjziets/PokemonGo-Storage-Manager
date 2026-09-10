@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# TRACEWEAVER: file-role=validated-scan-entry; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+# TRACEWEAVER: entrypoint=validate_scan_start_arguments; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 """Pokemon Go Storage Manager — entry point."""
 
 import sys
@@ -286,18 +288,23 @@ def cmd_decide(args):
 def cmd_gui(args):
     """Launch the desktop GUI."""
     from pokemgr.gui.app import run_gui
+    queue_options = {"scan_queue": args.scan_queue} if getattr(args, "scan_queue", None) is not None else {}
     run_gui(
         start_scan=getattr(args, "start_scan", False),
         skip_first=getattr(args, "skip_first", None) or 0,
         resume_species=getattr(args, "resume_species", None) or "",
         resume_cp=getattr(args, "resume_cp", None) or 0,
+        **queue_options,
     )
 
 
 def add_scan_start_arguments(parser):
     """Share the explicit GUI start/resume options with the stream launcher."""
-    parser.add_argument("--start-scan", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--start-scan", action="store_true",
                         help="Connect and start all five scan passes with Unfavorite off")
+    mode.add_argument("--scan-queue", metavar="LEDGER",
+                      help="Start validated pending inventory partitions after Normal is complete")
     parser.add_argument("--skip-first", type=int, metavar="N",
                         help="Skip N saved positions on the first pass (requires --start-scan)")
     parser.add_argument("--resume-species", metavar="NAME",
@@ -323,6 +330,13 @@ def validate_scan_start_arguments(parser, args):
     if ((args.resume_species is not None or args.resume_cp is not None)
             and not args.skip_first):
         parser.error("a resume target requires --skip-first greater than zero")
+    if getattr(args, "scan_queue", None) is not None:
+        from pokemgr.indexer.scan_queue import load_scan_queue
+        try:
+            args.scan_queue = str(Path(args.scan_queue).expanduser().resolve())
+            load_scan_queue(args.scan_queue)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
 
 
 def main():

@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 
+# TRACEWEAVER: file-role=appraisal-snapshot-policy; req=REQ-SCAN-001; trace=TRACE-SCAN-001; ver=VER-SCAN-001
 # These regions deliberately avoid the animated Pokemon model.  They cover the
 # name/HP card, appraisal bars, and the professor's caught-species bubble.
 _STABILITY_ROIS = (
@@ -46,6 +47,7 @@ class AppraisalSnapshot:
     appraisal_confidence: float
     read_complete: bool = True
     candy_family: str = ""
+    in_gym: bool = False
 
     @classmethod
     def from_reads(cls, detail: dict, appraisal: dict) -> "AppraisalSnapshot":
@@ -70,6 +72,7 @@ class AppraisalSnapshot:
             appraisal_confidence=float(appraisal.get("confidence", 0.0)),
             read_complete=bool(detail.get("snapshot_read_complete", True)),
             candy_family=detail.get("candy_family", ""),
+            in_gym=detail.get("in_gym") is True,
         )
 
     @property
@@ -97,6 +100,7 @@ class AppraisalSnapshot:
             "weight_tag": self.weight_tag,
             "height_tag": self.height_tag,
             "is_dynamax": self.is_dynamax,
+            "in_gym": self.in_gym,
             "confidence": self.detail_confidence,
         }
 
@@ -119,9 +123,12 @@ class SnapshotDecision:
     exact_form: bool = True
 
 
+# TRACEWEAVER: entrypoint=validate_snapshot; req=REQ-SCAN-001; trace=TRACE-SCAN-001; ver=VER-SCAN-001
 def validate_snapshot(snapshot: AppraisalSnapshot,
                       allow_calculated_cp: bool) -> SnapshotDecision:
     """Accept exact visible evidence or an unambiguous hidden-CP result."""
+    if snapshot.in_gym:
+        return SnapshotDecision(False, "defending gym hides full HP and storage CP")
     if not snapshot.read_complete:
         return SnapshotDecision(False, "snapshot OCR did not finish")
     if any(iv < 0 or iv > 15 for iv in snapshot.ivs):
@@ -288,16 +295,17 @@ def validate_snapshot(snapshot: AppraisalSnapshot,
 def appraisal_region_diffs(first: Image.Image,
                            second: Image.Image) -> tuple[float, ...]:
     """Return mean pixel differences for static appraisal identity regions."""
-    a = np.asarray(first.convert("RGB"), dtype=np.int16)
-    b = np.asarray(second.convert("RGB"), dtype=np.int16)
-    if a.shape != b.shape:
+    if first.size != second.size:
         return (float("inf"),)
 
-    h, w = a.shape[:2]
+    w, h = first.size
     diffs = []
     for x1, y1, x2, y2 in _STABILITY_ROIS:
-        a_crop = a[int(h * y1):int(h * y2), int(w * x1):int(w * x2)]
-        b_crop = b[int(h * y1):int(h * y2), int(w * x1):int(w * x2)]
+        # Convert just the compared regions, not two entire full-resolution
+        # screenshots. Signed arithmetic still prevents unsigned wraparound.
+        box = (int(w * x1), int(h * y1), int(w * x2), int(h * y2))
+        a_crop = np.asarray(first.crop(box).convert("RGB"), dtype=np.int16)
+        b_crop = np.asarray(second.crop(box).convert("RGB"), dtype=np.int16)
         if not a_crop.size or a_crop.shape != b_crop.shape:
             diffs.append(float("inf"))
             continue

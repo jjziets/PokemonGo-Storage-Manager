@@ -1,7 +1,9 @@
 """Clock bounds and the persistent helper protocol, with no device access."""
+# TRACEWEAVER: file-role=source-clock-bounds-tests; verifies=VER-SCAN-001; req=REQ-STREAM-001; trace=TRACE-STREAM-001
 import unittest
 import io
 import subprocess
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from pokemgr.adb import clock_sync as clocks
@@ -98,6 +100,89 @@ class ClockSyncTests(unittest.TestCase):
         bounds = sync.map_pts_us(1501, now_ns=2010000)
         self.assertEqual(bounds.uncertainty_ns, 2099)
         self.assertNotEqual(bounds.sync_generation, old.sync_generation)
+        self.assertEqual(bounds.continuity_token, old.continuity_token)
+        self.assertEqual(sync.continuity_token, bounds.continuity_token)
+
+    # TRACEWEAVER: verifies=VER-SCAN-001; req=REQ-SCAN-003; trace=TRACE-SCAN-003
+    def test_continuity_is_unique_per_clock_and_frozen_into_old_bounds(self):
+        first, second = AndroidClockSync(), AndroidClockSync()
+        self.assertRegex(first.continuity_token, r'^[0-9a-f]{32}$')
+        self.assertNotEqual(first.continuity_token, second.continuity_token)
+        first.observe(sample())
+        old = first.map_pts_us(501, now_ns=1010000)
+        second.observe(sample())
+        other = second.map_pts_us(501, now_ns=1010000)
+        self.assertEqual(old.sync_generation, other.sync_generation)
+        self.assertNotEqual(old.continuity_token, other.continuity_token)
+        first.invalidate()
+        self.assertNotEqual(old.continuity_token, first.continuity_token)
+        first.observe(next_sample())
+        new = first.map_pts_us(1501, now_ns=2010000)
+        self.assertEqual(first.continuity_token, new.continuity_token)
+        self.assertNotEqual(old.continuity_token, new.continuity_token)
+        self.assertEqual((1, 3), (old.sync_generation, new.sync_generation))
+
+    def test_failed_sample_rotates_continuity_and_cannot_leave_a_mapping(self):
+        for bad in (None, next_sample(device_serial='other'),
+                    next_sample(device_boottime_ns=1701000),
+                    next_sample(host_send_ns=2100000, host_receive_ns=2101000)):
+            with self.subTest(bad=bad):
+                sync = AndroidClockSync(max_drift_ppm=0)
+                sync.observe(sample())
+                token = sync.continuity_token
+                with self.assertRaises(ClockSyncError):
+                    sync.observe(bad)
+                self.assertNotEqual(token, sync.continuity_token)
+                self.assertEqual(2, sync.generation)
+                with self.assertRaisesRegex(ClockSyncError, 'not been synchronized'):
+                    sync.map_pts_us(1501, now_ns=2200000)
+
+    def test_expired_mapping_failure_rotates_continuity(self):
+        sync = AndroidClockSync(max_age_ns=10000, max_drift_ppm=0)
+        sync.observe(sample())
+        old = sync.map_pts_us(501, now_ns=1010000)
+        with self.assertRaisesRegex(ClockSyncError, 'expired'):
+            sync.map_pts_us(501, now_ns=1012001)
+        self.assertNotEqual(old.continuity_token, sync.continuity_token)
+        self.assertEqual(2, sync.generation)
+        self.assertFalse(old.fresh_at(1012001, max_age_ns=100000))
+
+    def test_expired_sample_coverage_gap_rotates_only_continuity_not_extra_generation(self):
+        for elapsed, same_token in ((10000, True), (10001, False)):
+            with self.subTest(elapsed=elapsed):
+                sync = AndroidClockSync(max_age_ns=10000, max_drift_ppm=0)
+                initial = sample()
+                sync.observe(initial)
+                token = sync.continuity_token
+                moved = replace(initial, **{
+                    name: getattr(initial, name) + elapsed
+                    for name in ('host_send_ns', 'host_receive_ns', 'device_before_ns',
+                                 'device_after_ns', 'device_boottime_ns')
+                })
+                self.assertEqual(2, sync.observe(moved))
+                self.assertEqual(same_token, token == sync.continuity_token)
+                bounds = sync.map_pts_us(511, now_ns=moved.host_receive_ns + 8000)
+                self.assertEqual(sync.continuity_token, bounds.continuity_token)
+                self.assertEqual(2, bounds.sync_generation)
+                self.assertEqual(moved.host_receive_ns + 10000, bounds.valid_until_ns)
+
+    def test_continuity_does_not_relax_source_time_or_freshness_bounds(self):
+        sync = AndroidClockSync(max_age_ns=10000000, max_drift_ppm=0)
+        sync.observe(sample())
+        old = sync.map_pts_us(501, now_ns=1010000)
+        sync.observe(next_sample())
+        new = sync.map_pts_us(1501, now_ns=2010000)
+        self.assertEqual(old.continuity_token, new.continuity_token)
+        self.assertFalse(new.strictly_after(new.earliest_ns))
+        self.assertFalse(new.fresh_at(2010000, max_age_ns=2010000 - new.earliest_ns - 1))
+        token = sync.continuity_token
+        with self.assertRaises(ClockSyncError):
+            sync.map_pts_us(10000, now_ns=2010000, received_ns=2010000)
+        self.assertNotEqual(token, sync.continuity_token)
+
+    def test_legacy_frame_bounds_have_no_inferred_continuity(self):
+        bounds = clocks.FrameTimeBounds(100, 200, 1, 300)
+        self.assertIsNone(bounds.continuity_token)
 
     def test_clock_changes_invalidate_all_old_evidence(self):
         for changed in [{'device_serial': 'other'}, {'boot_id': '22345678-1234-1234-1234-123456789abc'}, {'host_send_ns': 1001999}, {'device_before_ns': 500200, 'device_after_ns': 500300}, {'device_boottime_ns': 1701000}, {'host_send_ns': 2100000, 'host_receive_ns': 2101000}]:
