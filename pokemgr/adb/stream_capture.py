@@ -9,7 +9,11 @@ from .frame_buffer import FrameBuffer
 
 # TRACEWEAVER: file-role=fresh-stream-capture; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
 class StreamCaptureTimeout(RuntimeError):
-    pass
+    """Optional observations explain a timeout without changing retry policy."""
+
+    def __init__(self, message, *, details=None):
+        super().__init__(message)
+        self.details = dict(details or {})
 
 
 class StreamCapture:
@@ -68,19 +72,44 @@ class StreamCapture:
             return self._epoch
 
     # TRACEWEAVER: entrypoint=StreamCapture._image; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
-    def _image(self, sequence, *, after_ns, max_age_ns=250_000_000, epoch=None):
+    def _image(self, sequence, *, after_ns, max_age_ns=250_000_000, epoch=None,
+               diagnostics=None):
         frame = self.buffer.read(sequence)
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics.update(reason="rejected_slot_race", sequence=sequence)
         if frame is None:
             return None
+        if diagnostics is not None:
+            diagnostics.update(pts_us=frame.pts_us, received_ns=frame.received_ns)
         with self._lock:
             if (self._pending_invalidation or (epoch is not None and epoch != self._epoch)
                     or frame.pts_us <= self._last_pts_us):
+                if diagnostics is not None:
+                    diagnostics["reason"] = (
+                        "invalidated" if self._pending_invalidation or
+                        (epoch is not None and epoch != self._epoch)
+                        else "rejected_nonincreasing_pts"
+                    )
                 return None
             now = time.monotonic_ns()
             bounds = self.clock.map_pts_us(frame.pts_us, now_ns=now,
                                           received_ns=frame.received_ns)
             if not (bounds.strictly_after(max(after_ns, self._after_ns))
                     and bounds.fresh_at(now, max_age_ns=max_age_ns)):
+                if diagnostics is not None:
+                    reason = "rejected_other_bounds"
+                    if now - bounds.earliest_ns > max_age_ns:
+                        reason = "rejected_stale"
+                    elif bounds.earliest_ns <= self._after_ns:
+                        reason = "rejected_preinput"
+                    elif bounds.earliest_ns <= after_ns:
+                        reason = "rejected_pre_request"
+                    diagnostics.update(
+                        reason=reason, earliest_ns=bounds.earliest_ns,
+                        latest_ns=bounds.latest_ns, clock_generation=bounds.sync_generation,
+                        boundary_delta_ms=(bounds.earliest_ns - max(after_ns, self._after_ns)) / 1e6,
+                    )
                 return None
             self._last_sequence = frame.sequence
             self._last_pts_us = frame.pts_us
@@ -99,6 +128,9 @@ class StreamCapture:
         self._synchronize()
         deadline = time.monotonic() + timeout
         considered = self._last_sequence
+        latest = considered
+        examined = 0
+        diagnostics = {}
         while time.monotonic() < deadline:
             if epoch != self._current_epoch():
                 raise StreamCaptureTimeout("Stream capture was invalidated")
@@ -108,13 +140,34 @@ class StreamCapture:
                 # source pixels cannot become newer while this request waits;
                 # a raced overwrite also requires a later sequence.
                 considered = latest
-                image = self._image(latest, after_ns=requested_ns, epoch=epoch)
+                examined += 1
+                image = self._image(latest, after_ns=requested_ns, epoch=epoch,
+                                    diagnostics=diagnostics)
                 if image is not None:
                     if epoch != self._current_epoch():
                         raise StreamCaptureTimeout("Stream capture was invalidated")
                     return image
             time.sleep(0.005)
-        raise StreamCaptureTimeout("No new source frame after the last input")
+        # Describe only observations already made; never copy or remap a frame
+        # for logging, or substitute receipt time for source freshness. The
+        # reason is from the last rejection; ages are measured at timeout.
+        now = time.monotonic_ns()
+        details = {
+            "reason": diagnostics.get("reason", "no_new_frames"),
+            "latest_sequence": latest, "last_accepted_sequence": self._last_sequence,
+            "examined_frames": examined,
+        }
+        for key in ("pts_us", "clock_generation", "boundary_delta_ms"):
+            if key in diagnostics:
+                details[key] = diagnostics[key]
+        if "received_ns" in diagnostics:
+            details["host_arrival_age_ms"] = (now - diagnostics["received_ns"]) / 1e6
+        if "earliest_ns" in diagnostics:
+            details["source_age_ms"] = [
+                (now - diagnostics["latest_ns"]) / 1e6,
+                (now - diagnostics["earliest_ns"]) / 1e6,
+            ]
+        raise StreamCaptureTimeout("No new source frame after the last input", details=details)
 
     def frames(self, *, after_ns, timeout=1.2, max_frames=30, should_stop=lambda: False):
         """Yield a bounded chronological window after a gesture; no OCR queue."""

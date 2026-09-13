@@ -1,4 +1,5 @@
 """Controller boundaries for the explicit app-only stream source; no ADB."""
+# TRACEWEAVER: file-role=stream-controller-tests; verifies=VER-SCAN-001; req=REQ-STREAM-001; trace=TRACE-STREAM-001
 
 import io
 import os
@@ -101,6 +102,39 @@ class StreamControllerTests(unittest.TestCase):
         self.assertEqual((96, 128), frame.size)
         self.assertEqual([["exec-out", "screencap", "-j", "-d", "115"]], self.capture_commands())
         self.assertEqual(3, sum(call.args[0] == QUERY for call in self.adb._run.call_args_list))
+
+    def test_timeout_warning_is_once_per_burst_and_retains_diagnostics(self):
+        timeout = StreamCaptureTimeout("no fresh frame", details={
+            "reason": "rejected_stale", "latest_sequence": 17,
+            "source_age_ms": [500.0, 520.0], "host_arrival_age_ms": 20.0,
+        })
+        self.source.capture.side_effect = [timeout, timeout, self.frame, timeout]
+        with self.assertLogs("pokemgr.adb.controller", level="WARNING") as messages:
+            for _ in range(4):
+                self.adb.screencap()
+        self.assertEqual(2, len(messages.output))
+        self.assertTrue(all("rejected_stale" in line and "17" in line
+                            and "source_age_ms" in line for line in messages.output))
+        self.assertEqual(3, len(self.capture_commands()))
+
+    def test_validated_stream_window_resets_timeout_warning_burst(self):
+        self.source.capture.side_effect = StreamCaptureTimeout("no fresh frame")
+        with self.assertLogs("pokemgr.adb.controller", level="WARNING") as messages:
+            self.adb.screencap()
+            self.adb.screencap()
+            list(self.adb.stream_frames(after_ns=100))
+            self.adb.screencap()
+        self.assertEqual(2, len(messages.output))
+
+    def test_invalidated_timeout_does_not_report_source_stall(self):
+        def timeout():
+            self.adb.invalidate_stream_frames()
+            raise StreamCaptureTimeout("invalidated", details={"reason": "invalidated"})
+        self.source.capture.side_effect = timeout
+        with self.assertNoLogs("pokemgr.adb.controller", level="WARNING"):
+            with self.assertRaises(StreamCaptureInvalidated):
+                self.adb.screencap()
+        self.assertEqual([], self.capture_commands())
 
     def test_timeout_does_not_fallback_after_display_epoch_changes(self):
         def timeout():

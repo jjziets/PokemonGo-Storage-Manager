@@ -483,7 +483,9 @@ class VisibleSettledPairReuseTests(unittest.TestCase):
             self.older.info[field] = original
 
     def test_legacy_pair_requires_independent_capture_times(self):
-        for image in self.pair:
+        # This case isolates legacy receipt validity; the fresh confirmation
+        # must use the same capture source, rather than an implicit JPEG→stream switch.
+        for image in (*self.pair, self.fresh):
             for field in tuple(image.info):
                 if field.startswith("pokemgr_stream_") or field == "pokemgr_source_clock_generation":
                     del image.info[field]

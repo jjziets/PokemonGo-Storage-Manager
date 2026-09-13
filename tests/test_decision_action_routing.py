@@ -1,5 +1,7 @@
 """Decisions owns the same verified action workers through cleanup and stop."""
 
+# TRACEWEAVER: file-role=decision-action-routing-tests; req=REQ-MASS-001; trace=TRACE-MASS-001; verifies=VER-SCAN-001
+
 from types import MethodType
 import unittest
 from unittest.mock import Mock, patch
@@ -81,6 +83,10 @@ class DecisionActionRoutingTests(unittest.TestCase):
                 target.mass_tab.set_running.assert_not_called()
                 action.progress.emit(2, 10, 'Checked Dragonite')
                 target.decision_tab.on_fav_progress.assert_called_once_with(2, 10, 'Checked Dragonite')
+                payload = {'traversal_id': 2, 'checked': 2, 'phase': 'reading'}
+                action.action_progress.emit(payload)
+                target.decision_tab.on_action_progress.assert_called_once_with(payload)
+                target.mass_tab.on_action_progress.assert_not_called()
                 action.error.emit('Read held')
                 target.decision_tab.on_fav_error.assert_called_once_with('Read held')
                 target.decision_tab.fav_pause_btn.text.return_value = 'Pause'
@@ -112,14 +118,18 @@ class DecisionActionRoutingTests(unittest.TestCase):
             old.finished.emit(result)
             followup()
         target.decision_tab.on_fav_finished.assert_called_once_with({**result, 'aborted': True})
+        old.action_progress.emit({'phase': 'late after cleanup'})
+        target.decision_tab.on_action_progress.assert_not_called()
         target._start_decision_worker(new)
         target.decision_tab.reset_mock()
         old.progress.emit(99, 99, 'old')
+        old.action_progress.emit({'phase': 'late after replacement'})
         old.error.emit('old')
         old.finished.emit({'favorited': 99})
         followup()
         target.decision_tab.on_fav_finished.assert_not_called()
         target.decision_tab.on_fav_progress.assert_not_called()
+        target.decision_tab.on_action_progress.assert_not_called()
         target.decision_tab.on_fav_error.assert_not_called()
         new.abort.assert_not_called()
 

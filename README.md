@@ -98,6 +98,20 @@ every suggested transfer is unnecessary.
 
 ### Execution
 
+**Review PvP cleanup…** in Decisions or Mass Actions lists recorded favorites
+marked `TRANSFER` with 0–2★ appraisal. Every `KEEP` and every 3–4★ Pokémon is
+protected. Uncheck personal exceptions, then choose **Dry run selected** or
+**Unfavorite selected**. Matching Pokémon are selected together; unchecking one
+protects the entire group. Cleanup can remove all matching stars when every
+member is reviewed as unwanted and the complete live group is verified.
+Incomplete, conflicting or unverified groups stay favorited. Confirmed results
+are saved for the whole group without assigning changes to arbitrary duplicates.
+It verifies a filtered group first, then swipes through that group to unfavorite
+the selected matches. Dry run only verifies. Leave the device alone during a run.
+Use the scanned account and device. Cleanup follows your saved decisions and
+does not reassess evolution potential or moves. Manual KEEP/TRANSFER changes
+are saved before either list refreshes; rerunning the engine replaces them.
+
 After reviewing decisions in the GUI, the executor:
 1. Narrows each keeper pass to pending CP values and excludes existing favorites with `!favorite`, then verifies the complete in-game search filter.
 2. Reads stable appraisal evidence through the shared scanner.
@@ -105,6 +119,13 @@ After reviewing decisions in the GUI, the executor:
 4. Checks identity and the observed star, toggles once when needed, and verifies the result.
 5. Refreshes the remaining results after changes, verifying that the count decreased by exactly the confirmed favorites. Confirmed gym defenders with hidden HP are skipped without changing their stars.
 6. Reports unmatched, ambiguous, stopped and failed results for review. It never transfers Pokemon.
+
+Both Decisions and Mass Actions show the selected keeper pass (for example,
+`Pass 1/5: Normal`), the categories still to come, and cumulative keeper counts.
+The progress bar describes only the current CP batch and refresh round. Its
+count can restart as confirmed favorites leave the results; the overall tally
+continues across those rounds. Pending targets and records needing review stay
+visible at completion. Dry runs label matches as “would favorite.”
 
 ## Features
 

@@ -1,3 +1,4 @@
+# TRACEWEAVER: file-role=decision-and-reviewed-action-interface; req=REQ-MASS-001,REQ-DECISION-001; trace=TRACE-MASS-001,TRACE-DECISION-001; ver=VER-SCAN-001
 """Decision review panel — keep/transfer lists with manual overrides."""
 
 import html
@@ -12,12 +13,13 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 
 from ...data.models import Pokemon
+from .keeper_progress import KeeperProgress
 
 
 class DecisionReview(QWidget):
     """Two-panel view: KEEP list (left) and TRANSFER list (right)."""
 
-    decisions_changed = Signal()
+    decision_requested = Signal(int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -75,6 +77,11 @@ class DecisionReview(QWidget):
         )
         top_bar.addWidget(self.favorite_real_btn)
 
+        self.pvp_cleanup_btn = QPushButton("Review PvP cleanup…")
+        self.pvp_cleanup_btn.setToolTip(
+            "Review unfavoriting of 0–2★ TRANSFER records. Protects all KEEP and all 3–4★ Pokémon."
+        )
+        top_bar.addWidget(self.pvp_cleanup_btn)
         top_bar.addStretch()
         layout.addLayout(top_bar)
 
@@ -166,6 +173,8 @@ class DecisionReview(QWidget):
         layout.addLayout(pass_bar)
 
         # ── Favorite progress (hidden until active) ──
+        self.keeper_progress = KeeperProgress()
+        layout.addWidget(self.keeper_progress)
         self.fav_progress_bar = QProgressBar()
         self.fav_progress_bar.setTextVisible(True)
         self.fav_progress_bar.setFormat("Ready")
@@ -221,6 +230,7 @@ class DecisionReview(QWidget):
 
         move_to_transfer_btn = QPushButton("Move to TRANSFER >>")
         move_to_transfer_btn.clicked.connect(self._move_to_transfer)
+        self.move_to_transfer_btn = move_to_transfer_btn
         keep_layout.addWidget(move_to_transfer_btn)
 
         splitter.addWidget(keep_group)
@@ -238,6 +248,7 @@ class DecisionReview(QWidget):
 
         move_to_keep_btn = QPushButton("<< Move to KEEP")
         move_to_keep_btn.clicked.connect(self._move_to_keep)
+        self.move_to_keep_btn = move_to_keep_btn
         transfer_layout.addWidget(move_to_keep_btn)
 
         splitter.addWidget(transfer_group)
@@ -299,24 +310,30 @@ class DecisionReview(QWidget):
         tree.resizeColumnToContents(2)
 
     def _move_to_transfer(self):
+        if not self.move_to_transfer_btn.isEnabled():
+            return
         item = self.keep_tree.currentItem()
         if not item or item.parent() is None:
             return  # skip species group headers
         pid = item.data(0, Qt.UserRole)
         if pid and pid in self._pokemon_map:
-            self._pokemon_map[pid].decision = "TRANSFER"
-            self._pokemon_map[pid].decision_reason = "MANUAL"
-            self.decisions_changed.emit()
+            self.decision_requested.emit(pid, "TRANSFER")
 
     def _move_to_keep(self):
+        if not self.move_to_keep_btn.isEnabled():
+            return
         item = self.transfer_tree.currentItem()
         if not item or item.parent() is None:
             return
         pid = item.data(0, Qt.UserRole)
         if pid and pid in self._pokemon_map:
-            self._pokemon_map[pid].decision = "KEEP"
-            self._pokemon_map[pid].decision_reason = "MANUAL"
-            self.decisions_changed.emit()
+            self.decision_requested.emit(pid, "KEEP")
+
+    def set_decision_editing_enabled(self, enabled):
+        self.move_to_keep_btn.setEnabled(enabled)
+        self.move_to_transfer_btn.setEnabled(enabled)
+        for check in self.rule_checks.values():
+            check.setEnabled(enabled)
 
     def get_enabled_rules(self) -> list[str]:
         """Return list of enabled decision rule IDs."""
@@ -351,8 +368,11 @@ class DecisionReview(QWidget):
         self.favorite_real_btn.setEnabled(not active)
         self.run_engine_btn.setEnabled(not active)
         self.unfavorite_btn.setEnabled(not active)
+        self.pvp_cleanup_btn.setEnabled(not active)
+        self.set_decision_editing_enabled(not active)
 
         if active:
+            self.keeper_progress.reset()
             self._fav_dry_run = dry_run
             self._fav_action = action
             self._fav_last_error = None
@@ -386,6 +406,7 @@ class DecisionReview(QWidget):
             self._fav_paused_at = None
         self.fav_pause_btn.setText("Resume" if paused else "Pause")
         self.fav_status_label.setText("Paused" if paused else self._fav_running_label)
+        self.keeper_progress.set_paused(paused)
 
     def set_fav_stopping(self):
         if not self._fav_active:
@@ -394,6 +415,7 @@ class DecisionReview(QWidget):
         self.fav_pause_btn.setEnabled(False)
         self.fav_stop_btn.setEnabled(False)
         self.fav_status_label.setText("Stopping...")
+        self.keeper_progress.set_stopping()
 
     def _append_fav_log(self, message: str):
         escaped = html.escape(str(message)).replace("\n", "<br>")
@@ -409,9 +431,18 @@ class DecisionReview(QWidget):
         self.fav_status_label.setStyleSheet("font-weight: bold; color: #f88;")
         self._append_fav_log(f"ERROR: {message}")
 
+    def on_action_progress(self, payload: dict):
+        if not self._fav_active:
+            return
+        self.keeper_progress.update_progress(payload)
+        self.keeper_progress.render_traversal(self.fav_progress_bar)
+
     def on_fav_progress(self, current: int, total: int, message: str):
         """Update favorite progress. current=checked, total=Pokemon in filter."""
         if not self._fav_active:
+            return
+        if self.keeper_progress.has_progress:
+            self._append_fav_log(message)
             return
         self.fav_progress_bar.setRange(0, total if total > 0 else 0)
         self.fav_progress_bar.setValue(current)
@@ -437,14 +468,19 @@ class DecisionReview(QWidget):
             )
         self._append_fav_log(message)
 
+    # TRACEWEAVER: entrypoint=DecisionReview.on_fav_finished; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
     def on_fav_finished(self, result: dict):
         """Keep the actual outcome visible after the worker has released resources."""
         dry = self._fav_dry_run or result.get("dry_run", False)
         labels = {"db_synced": "favorite status saved",
                   "db_unresolved": "favorite status not saved"}
+        if "verified" in result:
+            labels.update(verified="cards verified", checked="action checks")
         counts = []
         for key, value in result.items():
-            if type(value) is not int or (dry and key in labels):
+            if type(value) is not int or (dry and key in ("db_synced", "db_unresolved")):
+                continue
+            if dry and key == "checked" and "verified" in result:
                 continue
             label = labels.get(key, key.replace("_", " "))
             if dry and key in ("favorited", "unfavorited"):
@@ -476,6 +512,7 @@ class DecisionReview(QWidget):
         self.fav_status_label.setText(status)
         self.fav_status_label.setStyleSheet(f"font-weight: bold; color: {color};")
         self._append_fav_log(status)
+        self.keeper_progress.finish({**result, "dry_run": dry})
         self.set_favoriting(False)
         if self.fav_progress_bar.maximum() == 0:
             self.fav_progress_bar.setRange(0, 1)

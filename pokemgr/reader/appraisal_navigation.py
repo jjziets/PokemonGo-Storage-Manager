@@ -1,4 +1,4 @@
-"""Locate the visible forward triangle on an appraisal, without fixed targets."""
+"""Locate visible appraisal navigation triangles without fixed targets."""
 
 # TRACEWEAVER: file-role=appraisal-forward-target; req=REQ-SCAN-003,REQ-MASS-001; trace=TRACE-SCAN-003; ver=VER-SCAN-001
 
@@ -18,6 +18,16 @@ def next_appraisal_target(image: Image.Image) -> tuple[int, int] | None:
     the first position. Uncertain shape, clipping or multiple arrows fall back
     to the caller's existing navigation rather than inventing a tap target.
     """
+    return _appraisal_target(image, reverse=False)
+
+
+# TRACEWEAVER: entrypoint=previous_appraisal_target; req=REQ-SCAN-003; trace=TRACE-SCAN-003; ver=VER-SCAN-001
+def previous_appraisal_target(image: Image.Image) -> tuple[int, int] | None:
+    """Return an observed left-arrow interior while keeping the IV bars in place."""
+    return _appraisal_target(image, reverse=True)
+
+
+def _appraisal_target(image: Image.Image, *, reverse: bool) -> tuple[int, int] | None:
     boxes = find_bars(image)
     if boxes is None or len(boxes) != 3:
         return None
@@ -31,8 +41,8 @@ def next_appraisal_target(image: Image.Image) -> tuple[int, int] | None:
     middle = boxes[1]
     scale = height / 2376
     margin = max(round(48 * scale), middle.h * 3)
-    left, top = int(width * .91), max(0, middle.y - margin)
-    right, bottom = width, min(height, middle.y2 + margin)
+    left, right = (0, int(width * .09)) if reverse else (int(width * .91), width)
+    top, bottom = max(0, middle.y - margin), min(height, middle.y2 + margin)
     rgb = np.asarray(image.crop((left, top, right, bottom)).convert("RGB"))
     if not rgb.size:
         return None
@@ -65,14 +75,17 @@ def next_appraisal_target(image: Image.Image) -> tuple[int, int] | None:
         if hull_area <= 0 or cv2.contourArea(contour) / hull_area < .9:
             continue
         # Compare a filled triangle, tolerating antialiasing and rounded tips.
-        # A left arrow, diamond, rectangle or jacket edge has different mass
+        # The wrong arrow direction, diamond, rectangle or jacket edge has different mass
         # distribution and cannot satisfy both orientation and overlap.
         ideal = np.zeros_like(component)
-        cv2.fillConvexPoly(ideal, np.array(((0, 0), (0, h-1), (w-1, h//2)), np.int32), 1)
+        points = (((w-1, 0), (w-1, h-1), (0, h//2)) if reverse
+                  else ((0, 0), (0, h-1), (w-1, h//2)))
+        cv2.fillConvexPoly(ideal, np.array(points, np.int32), 1)
         union = np.count_nonzero(component | ideal)
         overlap = np.count_nonzero(component & ideal)
         cx, cy = centroids[index]
-        if union == 0 or overlap / union < .72 or cx - x > .44 * w:
+        wrong_mass = cx - x < .56 * w if reverse else cx - x > .44 * w
+        if union == 0 or overlap / union < .72 or wrong_mass:
             continue
         local_x, local_y = round(cx - x), round(cy - y)
         # Check clearance inside the observed white glyph, not merely its box.

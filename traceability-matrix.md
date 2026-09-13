@@ -18,6 +18,57 @@ Baseline: `REQ-BASELINE-2026-09-09-001`; semantic SHA256 `4b966981a29f704128139c
 
 ## Evidence and held claims
 
+Publication bookkeeping: `docs/reviews/2026-09-13-cleanup-publication.md` records
+the current commit/push target and reused verification. `pokemgr/data/models.py`
+and `tests/test_model_star_rating.py` implement and verify REQ-MASS-001's exact
+appraisal-star cleanup eligibility (TRACE-MASS-001, VER-SCAN-001).
+`pokemgr/reader/appraisal_navigation.py` and
+`tests/test_checkpoint_arrow_recovery.py` implement and verify REQ-SCAN-003's
+observed checkpoint navigation (TRACE-SCAN-003, VER-SCAN-001). These links and
+source/test comments repair navigability without changing behavior or authority.
+
+REQ-MASS-001 / REQ-IDENTITY-001 / REQ-SCAN-004 / REQ-DATA-001 uniform cleanup
+group follow-up: `pokemgr/execution/pvp_cleanup.py` and
+`pokemgr/execution/executor.py` preserve accepted generic-family observations,
+require unanimous reviewed group authority, complete possibility coverage and
+live counts, then conditionally save whole-group OFF through
+`pokemgr/data/database.py`. `pokemgr/gui/widgets/pvp_cleanup.py` protects review
+groups as a unit. Tests in `tests/test_pvp_cleanup_plan.py`,
+`tests/test_pvp_cleanup_execution.py`, `tests/test_pvp_cleanup_batches.py`,
+`tests/test_database_reviewed_actions.py` and `tests/test_pvp_cleanup_gui.py`
+link the September13 owner clarification and Oricorio incident to
+`docs/reviews/2026-09-13-pvp-cleanup-uniform-groups.md`.
+
+REQ-MASS-001 / REQ-SCAN-004 / REQ-DATA-001 grouped PvP cleanup follows the
+owner's September13 request to swipe through filtered candidates rather than
+search per Pokémon. The executor verifies complete group inventories before
+selective action traversals; duplicate, incomplete, stale and changed-position
+evidence cannot authorize a star. `tests/test_pvp_cleanup_execution.py`,
+`tests/test_pvp_cleanup_batches.py`,
+`tests/test_pvp_cleanup_gui.py` and `pokemgr/gui/widgets/keeper_progress.py`
+link execution and phase feedback through `pokemgr/gui/widgets/decision_review.py`
+and `pokemgr/gui/widgets/mass_actions.py` to
+`docs/reviews/2026-09-13-pvp-cleanup-batches.md`.
+
+REQ-SCAN-001/002/003 appraisal settle follow-up: the shared acquisition in
+`pokemgr/indexer/state_machine.py` retries only read-only `appraisal_not_stable`
+exhaustion within its existing three-attempt budget, retaining all validation,
+transition and pause guards. `tests/test_appraisal_settle_retry.py` covers retry
+success, terminal typed holds and diagnostic-only failed frames. Incident evidence,
+verification and unproved live behavior are recorded in
+`docs/reviews/2026-09-12-appraisal-settle-retry.md`.
+
+REQ-MASS-001 / REQ-SCAN-004 / REQ-DATA-001 / REQ-DECISION-001 selective PvP
+cleanup follow-up: `pokemgr/execution/pvp_cleanup.py` plans only reviewed,
+unambiguous 0–2★ favorited TRANSFER records, preserving all KEEP and 3–4★.
+`pokemgr/execution/executor.py` performs exact selective OFF actions and the GUI
+shares a preview/dry run through `pokemgr/gui/widgets/pvp_cleanup.py` and
+`pokemgr/gui/workers.py`. Verification entry points are
+`tests/test_pvp_cleanup_plan.py`, `tests/test_pvp_cleanup_execution.py` and
+`tests/test_pvp_cleanup_gui.py`, `tests/test_database_reviewed_actions.py` and
+`tests/test_model_star_rating.py`. Owner scope, evidence and remaining model limits
+are recorded in `docs/reviews/2026-09-12-pvp-cleanup.md`.
+
 REQ-STREAM-001 / REQ-DATA-001 fixed-canvas follow-up: `pokemgr/config.py`,
 `scripts/stream_pokemon.py` and `pokemgr/adb/controller.py` request and validate
 968×2376/420 app geometry. `pokemgr/calibration/profile.py` and `evidence.py`
@@ -58,6 +109,29 @@ Evidence: `tests/test_favorite_db_sync.py`, `tests/test_scan_star_sync.py`,
 `docs/reviews/2026-09-10-favorite-database-sync.md`. Interrupted CP-free category
 passes do not establish exact per-record favorite state. No active app restart
 or live validation was performed for this fix.
+
+REQ-MASS-001 keeper progress follow-up: Decisions and Mass Actions share selected
+pass X/Y, upcoming categories, cumulative keeper/check counts, and separately
+labelled CP batch/refresh-round progress. `tests/test_favorite_progress.py` checks
+observational counters, lazy query ordering and partial outcomes;
+`tests/test_keeper_progress_widget.py` checks both panels through refresh, pause,
+stop, completion and dry runs. Worker/routing tests cover stale signals and cleanup.
+These checks are offline and do not claim verification against the running phone.
+
+REQ-SCAN-003/004 / REQ-STREAM-001 / REQ-DATA-001 tablet recovery follow-up:
+observed navigation departures, appraisal-arrow checkpoints and bounded fresh
+confirmation pairs are covered by `tests/test_storage_navigation_settle.py`,
+`tests/test_checkpoint_arrow_recovery.py` and
+`tests/test_transition_pair_revalidation.py`. Capture fallback reasons are
+covered by `tests/test_stream_capture.py` and `tests/test_stream_controller.py`.
+Transactional clearing of the active database connection, rollback, WAL and
+worker guards are covered by `tests/test_database_clear.py` and
+`tests/test_stream_resource_cleanup.py`. Authorized backup-and-prune recovery
+preserved all 786 tablet rows and removed 3,455 older phone rows. Evidence and
+manual-resume tagging limits: `docs/reviews/2026-09-11-tablet-recovery.md`.
+The 1,402-test offline suite passed; the owner authorized restart and the updated
+GUI/stream reopened with 786 records. The owner then began live keeper favoriting;
+the new multipass display was observed, but full-run reliability remains unverified.
 
 Current verification, review identities and local command results are summarized in `docs/reviews/2026-09-09-publication.md`. Tests linked above are representative entry points; publication runs the complete discovered suite. Native and private-image checks can be unavailable on a fresh checkout and are reported separately from reproducible checks. Historical inline VER-SCAN-001 anchors refer to the original test work and do not imply blanket acceptance of later features.
 

@@ -1,5 +1,7 @@
 """Data models for Pokemon storage."""
 
+# TRACEWEAVER: file-role=stored-pokemon-appraisal; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
+
 from dataclasses import dataclass
 
 
@@ -33,17 +35,21 @@ class Pokemon:
     confidence: float = 0.0
     scan_session_id: str = ""
 
+    # TRACEWEAVER: entrypoint=star_rating; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
     @property
     def star_rating(self) -> int:
-        """Return 0-4 star rating based on IV percentage."""
-        pct = self.iv_pct
-        if pct >= 0.978:  # 44+/45 = 4 star (hundo or near)
+        """Return the exact IV star rating, or -1 for incomplete/invalid IVs."""
+        ivs = (self.atk, self.def_, self.sta)
+        if any(type(value) is not int or not 0 <= value <= 15 for value in ivs):
+            return -1
+        total = sum(ivs)
+        if total == 45:
             return 4
-        elif pct >= 0.822:  # 37+/45 = 3 star
+        elif total >= 37:
             return 3
-        elif pct >= 0.667:  # 30+/45 = 2 star
+        elif total >= 30:
             return 2
-        elif pct >= 0.511:  # 23+/45 = 1 star
+        elif total >= 23:
             return 1
         return 0
 

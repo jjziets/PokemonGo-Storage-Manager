@@ -1,5 +1,7 @@
 """ADB controller for screen capture, taps, swipes, and device interaction."""
 
+# TRACEWEAVER: file-role=device-stream-controller; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
+
 import io
 import os
 import shlex
@@ -32,6 +34,7 @@ class StreamCaptureInvalidated(ADBError):
     """Discard this capture after input/pause; a fresh operation may retry."""
 
 
+# TRACEWEAVER: entrypoint=ADBController; req=REQ-STREAM-001; trace=TRACE-STREAM-001; ver=VER-SCAN-001
 class ADBController:
     """Controls an Android device via ADB for screen capture and input simulation."""
 
@@ -96,6 +99,7 @@ class ADBController:
         self._stream_fault = None
         self._stream_input_ns = 0
         self._stream_generation = 0
+        self._stream_fallback_warned = False
 
     @property
     def display_id(self) -> int | None:
@@ -127,6 +131,7 @@ class ADBController:
     def close_stream_capture(self):
         """Release the native ring reader and its persistent clock sampler."""
         self._stream_generation += 1
+        self._stream_fallback_warned = False
         source, self._stream_capture = self._stream_capture, None
         if source is not None:
             source.close()
@@ -161,6 +166,7 @@ class ADBController:
         from .frame_buffer import FrameBufferError
         target = self.validate_display_target()
         generation = self._stream_generation
+        delivered = False
         def stopped():
             return should_stop() or generation != self._stream_generation
         try:
@@ -169,6 +175,7 @@ class ADBController:
                                        max_frames=max_frames, should_stop=stopped):
                 if stopped():
                     return
+                delivered = True
                 yield image
                 # Check before asking the source iterator for its next frame:
                 # invalidate() clears clock evidence and may close the reader.
@@ -180,6 +187,8 @@ class ADBController:
             self._fail_stream(exc)
         finally:
             self.validate_display_target()
+            if delivered and generation == self._stream_generation:
+                self._stream_fallback_warned = False
 
     @timing.timed("adb.display_validation")
     def validate_display_target(self) -> dict | None:
@@ -410,14 +419,21 @@ class ADBController:
                 self.validate_display_target()
                 if generation != self._stream_generation:
                     raise StreamCaptureInvalidated("Stream capture was invalidated during the operation")
+                self._stream_fallback_warned = False
                 return image
-            except StreamCaptureTimeout:
+            except StreamCaptureTimeout as exc:
                 if generation != self._stream_generation:
                     raise StreamCaptureInvalidated("Stream capture was invalidated during the operation")
                 # Only an ordinary absence of fresh frames can use the existing
                 # fresh, frozen-target screencap path. Protocol/identity/clock
                 # errors are held and never silently converted to JPEG success.
-                log.info("No fresh stream frame; requesting a fresh app-display capture")
+                if not self._stream_fallback_warned:
+                    log.warning(
+                        "No fresh stream frame; requesting a fresh app-display capture; "
+                        "timeout diagnostics=%s (further warnings suppressed until stream recovery)",
+                        exc.details or {"reason": "unavailable"},
+                    )
+                    self._stream_fallback_warned = True
             except (ClockSyncError, FrameBufferError, OSError) as exc:
                 if generation != self._stream_generation:
                     raise StreamCaptureInvalidated("Stream capture was invalidated during the operation") from exc

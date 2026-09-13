@@ -1,5 +1,7 @@
 """Closing/reconnecting never closes stream resources underneath a scan."""
 
+# TRACEWEAVER: file-role=stream-resource-cleanup-tests; req=REQ-DATA-001; trace=TRACE-DATA-001; verifies=VER-SCAN-001
+
 import os
 from types import SimpleNamespace
 import unittest
@@ -13,7 +15,8 @@ from pokemgr.gui.main_window import MainWindow
 class StreamResourceCleanupTests(unittest.TestCase):
     @staticmethod
     def database_window():
-        return SimpleNamespace(db=Mock(), scan_tab=Mock(), _scan_worker=None,
+        return SimpleNamespace(db=Mock(), scan_tab=Mock(), collection_tab=Mock(),
+                               decision_tab=Mock(), _scan_worker=None,
                                _refresh_collection=Mock(), _refresh_decisions=Mock(),
                                statusBar=Mock(return_value=Mock()))
 
@@ -30,6 +33,7 @@ class StreamResourceCleanupTests(unittest.TestCase):
                     MainWindow._clear_database(window)
                 self.assertEqual([call.args[1] for call in warning.call_args_list], ["Operation Running"])
                 window.db.close.assert_not_called()
+                window.db.clear_scanned_data.assert_not_called()
                 factory.assert_not_called()
                 remove.assert_not_called()
 
@@ -47,6 +51,7 @@ class StreamResourceCleanupTests(unittest.TestCase):
         self.assertEqual([call.args[1] for call in warning.call_args_list],
                          ["Clear Database", "Operation Running"])
         window.db.close.assert_not_called()
+        window.db.clear_scanned_data.assert_not_called()
         factory.assert_not_called()
         remove.assert_not_called()
 
@@ -57,22 +62,53 @@ class StreamResourceCleanupTests(unittest.TestCase):
              patch("os.remove") as remove:
             MainWindow._clear_database(window)
         window.db.close.assert_not_called()
+        window.db.clear_scanned_data.assert_not_called()
         factory.assert_not_called()
         remove.assert_not_called()
 
-    def test_confirmed_idle_database_clear_replaces_only_the_idle_connection(self):
+    def test_confirmed_idle_database_clear_uses_the_same_connection_and_resets_views(self):
         window = self.database_window()
         original = window.db
         with patch("pokemgr.gui.main_window.QMessageBox.warning", return_value=QMessageBox.Yes), \
              patch("pokemgr.gui.main_window.PokemonDatabase") as factory, \
              patch("os.path.exists", return_value=True), patch("os.remove") as remove:
             MainWindow._clear_database(window)
-        original.close.assert_called_once()
-        factory.assert_called_once_with()
-        remove.assert_called_once()
-        self.assertIs(window.db, factory.return_value)
-        window._refresh_collection.assert_called_once()
-        window._refresh_decisions.assert_called_once()
+        original.clear_scanned_data.assert_called_once_with()
+        original.close.assert_not_called()
+        factory.assert_not_called()
+        remove.assert_not_called()
+        self.assertIs(window.db, original)
+        window.collection_tab.load_pokemon.assert_called_once_with([])
+        window.decision_tab.load_pokemon.assert_called_once_with([])
+        self.assertIsNone(window._last_session_id)
+        window.scan_tab.status_label.setText.assert_called_once_with("Database cleared")
+
+    def test_clear_failure_keeps_views_and_does_not_report_success(self):
+        window = self.database_window()
+        window.db.clear_scanned_data.side_effect = RuntimeError("Deletion rolled back")
+        with patch("pokemgr.gui.main_window.QMessageBox.warning", return_value=QMessageBox.Yes), \
+             patch("pokemgr.gui.main_window.QMessageBox.critical") as error, \
+             self.assertLogs("pokemgr.gui.main_window", level="ERROR"):
+            MainWindow._clear_database(window)
+        window.db.close.assert_not_called()
+        window.collection_tab.load_pokemon.assert_not_called()
+        window.decision_tab.load_pokemon.assert_not_called()
+        window.scan_tab.log_view.clear.assert_not_called()
+        window.scan_tab.status_label.setText.assert_called_once_with("Database clear failed")
+        self.assertEqual(error.call_args.args[1:], ("Database Clear Failed", "Deletion rolled back"))
+
+    def test_successful_clear_with_view_failure_does_not_claim_ready_for_scan(self):
+        window = self.database_window()
+        window.decision_tab.load_pokemon.side_effect = RuntimeError("Could not reset view")
+        with patch("pokemgr.gui.main_window.QMessageBox.warning", return_value=QMessageBox.Yes), \
+             patch("pokemgr.gui.main_window.QMessageBox.critical") as error, \
+             self.assertLogs("pokemgr.gui.main_window", level="ERROR"):
+            MainWindow._clear_database(window)
+        window.db.clear_scanned_data.assert_called_once()
+        window.scan_tab.status_label.setText.assert_called_once_with(
+            "Database cleared, but the display could not be refreshed")
+        self.assertEqual("Display Refresh Failed", error.call_args.args[1])
+        self.assertNotIn("ready", window.statusBar().showMessage.call_args.args[0])
 
     @staticmethod
     def stopping_window():
@@ -146,6 +182,8 @@ class StreamResourceCleanupTests(unittest.TestCase):
                 window = SimpleNamespace(adb=Mock(), statusBar=Mock(return_value=Mock()),
                                          _refresh_collection=Mock(), _refresh_decisions=Mock(),
                                          **{attribute: worker, tab: Mock()})
+                if tab == "mass_tab":
+                    window.decision_tab = Mock()
                 window.adb.has_stream_frames = True
                 setattr(window, poll.__name__, lambda owner=None: poll(window, owner))
                 with patch("PySide6.QtCore.QTimer.singleShot") as timer:
@@ -163,6 +201,8 @@ class StreamResourceCleanupTests(unittest.TestCase):
                 getattr(controls, setter).assert_not_called()
                 getattr(controls, label).setText.assert_called_with("Stopping...")
                 self.assertTrue(all(call.args[0] == 250 for call in timer.call_args_list))
+                if attribute == '_mass_worker':
+                    window.decision_tab.set_decision_editing_enabled.assert_not_called()
                 worker.isRunning.return_value = False
                 if attribute == '_mass_worker':
                     window._mass_result = {'aborted': True}
@@ -176,6 +216,7 @@ class StreamResourceCleanupTests(unittest.TestCase):
                 window._refresh_decisions.assert_called_once()
                 if attribute == '_mass_worker':
                     controls.on_finished.assert_called_once_with({'aborted': True})
+                    window.decision_tab.set_decision_editing_enabled.assert_called_once_with(True)
                 else:
                     controls.on_fav_finished.assert_called_once_with({'aborted': True})
 

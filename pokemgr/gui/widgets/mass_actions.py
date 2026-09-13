@@ -1,3 +1,4 @@
+# TRACEWEAVER: file-role=mass-action-interface; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
 """Mass actions panel — bulk operations on Pokemon storage."""
 
 import time
@@ -8,6 +9,7 @@ from PySide6.QtWidgets import (
     QLabel, QProgressBar, QTextEdit, QCheckBox, QGridLayout,
 )
 from PySide6.QtCore import Qt, Signal
+from .keeper_progress import KeeperProgress
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +25,8 @@ class MassActions(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._action_active = False
+        self._stopping = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -43,9 +47,15 @@ class MassActions(QWidget):
         self.unfav_all_btn.setToolTip("Swipe through ALL Pokemon and remove favorite star")
         unfav_layout.addWidget(self.unfav_all_btn)
 
+        self.pvp_cleanup_btn = QPushButton("Review PvP cleanup…")
+        self.pvp_cleanup_btn.setToolTip(
+            "Unfavorite selected 0–2★ TRANSFER records; all KEEP and 3–4★ Pokémon are protected."
+        )
+        unfav_layout.addWidget(self.pvp_cleanup_btn)
+
         unfav_layout.addStretch()
 
-        unfav_desc = QLabel("Removes star from every Pokemon. Run before scanning to start clean.")
+        unfav_desc = QLabel("PvP cleanup preserves your keepers and all 3–4★ favorites.")
         unfav_desc.setStyleSheet("color: #888;")
         unfav_layout.addWidget(unfav_desc)
 
@@ -121,6 +131,8 @@ class MassActions(QWidget):
         layout.addWidget(keep_group)
 
         # ── Progress section ──
+        self.keeper_progress = KeeperProgress()
+        layout.addWidget(self.keeper_progress)
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("Ready")
@@ -160,6 +172,8 @@ class MassActions(QWidget):
 
     def set_running(self, active: bool, label: str = ""):
         """Show/hide progress controls."""
+        self._action_active = active
+        self.pvp_cleanup_btn.setEnabled(not active)
         self.progress_bar.setVisible(active)
         self.pause_btn.setVisible(active)
         self.stop_btn.setVisible(active)
@@ -173,6 +187,8 @@ class MassActions(QWidget):
             btn.setEnabled(not active)
 
         if active:
+            self.keeper_progress.reset()
+            self._stopping = False
             self._last_error = ""
             self._running_label = label
             self._paused_at = None
@@ -189,6 +205,8 @@ class MassActions(QWidget):
             self._start_time = time.monotonic()
 
     def set_paused(self, paused: bool):
+        if not self._action_active or self._stopping:
+            return
         now = time.monotonic()
         if paused and self._paused_at is None:
             self._paused_at = now
@@ -197,19 +215,39 @@ class MassActions(QWidget):
             self._paused_at = None
         self.pause_btn.setText("Resume" if paused else "Pause")
         self.status_label.setText("Paused" if paused else self._running_label)
+        self.keeper_progress.set_paused(paused)
 
     def set_stopping(self):
+        if not self._action_active:
+            return
+        self._stopping = True
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("Stopping...")
+        self.keeper_progress.set_stopping()
 
     def on_error(self, message: str):
+        if not self._action_active:
+            return
         self._last_error = message
         self.status_label.setText(f"Error: {message}")
         self.status_label.setStyleSheet("font-weight: bold; color: #f88;")
         self.action_log.append(html.escape(f"ERROR: {message}"))
 
+    def on_action_progress(self, payload: dict):
+        if not self._action_active:
+            return
+        self.keeper_progress.update_progress(payload)
+        self.keeper_progress.render_traversal(self.progress_bar)
+
     def on_progress(self, current: int, total: int, message: str):
+        if not self._action_active:
+            return
+        self.action_log.append(html.escape(message))
+        scrollbar = self.action_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        if self.keeper_progress.has_progress:
+            return
         self.progress_bar.setRange(0, total if total > 0 else 0)
         self.progress_bar.setValue(current)
 
@@ -231,17 +269,18 @@ class MassActions(QWidget):
         else:
             self.progress_bar.setFormat(f"{current} — {rate * 60:.0f}/min")
 
-        self.action_log.append(html.escape(message))
-        scrollbar = self.action_log.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
+    # TRACEWEAVER: entrypoint=MassActions.on_finished; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
     def on_finished(self, result: dict):
         dry = result.get('dry_run', False)
         labels = {'db_synced': 'favorite status saved',
                   'db_unresolved': 'favorite status not saved'}
+        if 'verified' in result:
+            labels.update(verified='cards verified', checked='action checks')
         counts = []
         for key, value in result.items():
-            if type(value) is not int or (dry and key in labels):
+            if type(value) is not int or (dry and key in ('db_synced', 'db_unresolved')):
+                continue
+            if dry and key == 'checked' and 'verified' in result:
                 continue
             label = labels.get(key, key)
             if dry and key in ('favorited', 'unfavorited'):
@@ -271,6 +310,7 @@ class MassActions(QWidget):
         self.status_label.setText(status)
         self.status_label.setStyleSheet(f"font-weight: bold; color: {color};")
         self.action_log.append(html.escape(self.status_label.text()))
+        self.keeper_progress.finish(result)
         self.set_running(False)
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, 1)

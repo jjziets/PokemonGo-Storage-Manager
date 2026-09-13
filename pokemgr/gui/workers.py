@@ -252,6 +252,8 @@ class ScanFromCurrentWorker(QThread):
 class _ActionWorker(QThread):
     """Pause/abort survive setup and every exit delivers a terminal result."""
 
+    action_progress = Signal(dict)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._executor = None
@@ -380,6 +382,41 @@ class FavoriteFilterWorker(_ActionWorker):
             self._emit_result(result)
 
 
+class PvpCleanupWorker(_ActionWorker):
+    """Remove stars only for the frozen, reviewed cleanup selection."""
+
+    progress = Signal(int, int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, adb, profile, db, reviewed_candidates, *, dry_run=False, parent=None):
+        super().__init__(parent)
+        from dataclasses import replace
+        self.adb, self.profile, self.db = adb, profile, db
+        self.reviewed_candidates = tuple(replace(p) for p in reviewed_candidates)
+        self.dry_run = dry_run
+
+    def run(self):
+        result = {"unfavorited": 0, "checked": 0, "dry_run": self.dry_run}
+        try:
+            if self._abort_requested:
+                return
+            if not self._attach_executor(Executor(self.adb, self.profile, self.db)):
+                return
+            self._executor.on_progress = lambda cur, total, msg: self.progress.emit(cur, total, msg)
+            self._executor.on_error = lambda msg: self.error.emit(msg)
+            self._executor.on_action_progress = lambda payload: self.action_progress.emit(dict(payload))
+            result = self._executor.unfavorite_pvp_candidates(
+                self.reviewed_candidates, dry_run=self.dry_run,
+            )
+        except Exception as exc:
+            log.exception("PvP cleanup worker error")
+            self.error.emit(str(exc))
+            result = {**result, "error": str(exc)}
+        finally:
+            self._emit_result({**result, "dry_run": self.dry_run})
+
+
 class FavoriteWorker(_ActionWorker):
     """Favorites all KEEP Pokemon in the background."""
 
@@ -409,6 +446,7 @@ class FavoriteWorker(_ActionWorker):
             self._executor.on_progress = lambda cur, tot, msg: self.progress.emit(cur, tot, msg)
             self._executor.on_error = lambda msg: self.error.emit(msg)
 
+            self._executor.on_action_progress = lambda payload: self.action_progress.emit(dict(payload))
             result = self._executor.favorite_keepers(
                 dry_run=self.dry_run, selected_passes=self.selected_passes
             )

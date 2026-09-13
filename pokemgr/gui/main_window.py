@@ -14,7 +14,7 @@ from ..adb.controller import ADBController, ADBError
 from ..calibration.profile import CalibrationProfile
 from ..data.database import PokemonDatabase
 from ..decision.engine import DecisionEngine
-from ..config import ensure_dirs, DB_PATH
+from ..config import ensure_dirs
 
 from .widgets.scan_control import ScanControl
 from .widgets.collection_browser import CollectionBrowser
@@ -116,15 +116,17 @@ class MainWindow(QMainWindow):
         self.decision_tab.approve_btn.clicked.connect(lambda: self._start_favorite(dry_run=True))
         self.decision_tab.favorite_real_btn.clicked.connect(lambda: self._start_favorite(dry_run=False))
         self.decision_tab.unfavorite_btn.clicked.connect(self._unfavorite_all)
+        self.decision_tab.pvp_cleanup_btn.clicked.connect(lambda: self._review_pvp_cleanup())
         self.decision_tab.fav_pause_btn.clicked.connect(self._toggle_fav_pause)
         self.decision_tab.fav_stop_btn.clicked.connect(self._stop_favorite)
-        self.decision_tab.decisions_changed.connect(self._refresh_collection)
+        self.decision_tab.decision_requested.connect(self._save_manual_decision)
 
         # Collection tab
         self.collection_tab.dedup_btn.clicked.connect(self._remove_duplicates)
 
         # Mass Actions tab
         self.mass_tab.unfav_all_btn.clicked.connect(lambda: self._unfavorite_all(from_mass=True))
+        self.mass_tab.pvp_cleanup_btn.clicked.connect(lambda: self._review_pvp_cleanup(from_mass=True))
         self.mass_tab.favorite_filter.connect(self._start_favorite_filter)
         self.mass_tab.fav_keepers_dry_btn.clicked.connect(lambda: self._start_favorite(dry_run=True, from_mass=True))
         self.mass_tab.fav_keepers_real_btn.clicked.connect(lambda: self._start_favorite(dry_run=False, from_mass=True))
@@ -243,14 +245,27 @@ class MainWindow(QMainWindow):
             if MainWindow._running_device_workers(self):
                 QMessageBox.warning(self, "Operation Running", "Stop the current operation before clearing the database.")
                 return
-            self.db.close()
-            import os
-            db_path = str(DB_PATH)
-            if os.path.exists(db_path):
-                os.remove(db_path)
-            self.db = PokemonDatabase()
-            self._refresh_collection()
-            self._refresh_decisions()
+            try:
+                self.db.clear_scanned_data()
+            except Exception as exc:
+                log.exception("Database clear failed")
+                self.scan_tab.status_label.setText("Database clear failed")
+                self.statusBar().showMessage("Database clear failed")
+                QMessageBox.critical(self, "Database Clear Failed", str(exc))
+                return
+            self._last_session_id = None
+            try:
+                # These rows were verified empty by the committed transaction.
+                # Unlike ordinary refresh helpers, do not swallow view errors.
+                self.collection_tab.load_pokemon([])
+                self.decision_tab.load_pokemon([])
+            except Exception as exc:
+                log.exception("Database cleared but display refresh failed")
+                message = "Database cleared, but the display could not be refreshed"
+                self.scan_tab.status_label.setText(message)
+                self.statusBar().showMessage(message)
+                QMessageBox.critical(self, "Display Refresh Failed", f"{message}.\n\n{exc}")
+                return
             self.scan_tab.log_view.clear()
             self.scan_tab.progress_bar.setValue(0)
             self.scan_tab.status_label.setText("Database cleared")
@@ -543,6 +558,21 @@ class MainWindow(QMainWindow):
 
     # ── Decision engine ──────────────────────────────────────────────
 
+    @Slot(int, str)
+    def _save_manual_decision(self, pokemon_id, decision):
+        if MainWindow._running_device_workers(self):
+            QMessageBox.warning(self, "Operation Running", "Stop the current operation before changing decisions.")
+            return
+        if type(pokemon_id) is not int or pokemon_id <= 0 or decision not in ("KEEP", "TRANSFER"):
+            return
+        try:
+            self.db.set_manual_decision(pokemon_id, decision)
+        except Exception as exc:
+            QMessageBox.critical(self, "Decision Not Saved", str(exc))
+            return
+        self._refresh_collection()
+        self._refresh_decisions()
+
     @Slot()
     def _run_decision_engine(self):
         if MainWindow._running_device_workers(self):
@@ -637,6 +667,45 @@ class MainWindow(QMainWindow):
             return
         self._start_decision_worker(worker, dry_run=dry_run)
 
+    def _review_pvp_cleanup(self, *, from_mass=False):
+        from PySide6.QtWidgets import QDialog
+        from ..execution.executor import Executor
+        from ..execution.pvp_cleanup import plan_pvp_cleanup
+        from .widgets.pvp_cleanup import PvpCleanupDialog
+        from .workers import PvpCleanupWorker
+
+        if MainWindow._running_device_workers(self):
+            QMessageBox.warning(self, "Operation Running", "Stop the current operation before starting another.")
+            return
+        plan = plan_pvp_cleanup(self.db.get_all_for_cleanup(), Executor._keeper_key)
+        if not plan.eligible:
+            QMessageBox.information(
+                self, "No PvP Cleanup Candidates",
+                "No unambiguous, favorited 0–2★ TRANSFER records qualify.\n"
+                f"Protected favorites: {plan.protected:,}\nHeld for review: {plan.ambiguous:,}\n\n"
+                "Review your saved keeper decisions first. Phone state has not been checked.",
+            )
+            return
+        dialog = PvpCleanupDialog(plan, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        candidates = dialog.selected_candidates()
+        if not candidates:
+            return
+        if MainWindow._running_device_workers(self):
+            QMessageBox.warning(self, "Operation Running", "Stop the current operation before starting another.")
+            return
+        if not self.adb or not self.profile:
+            QMessageBox.warning(self, "Not Connected", "Connect to a device first.")
+            return
+        worker = PvpCleanupWorker(
+            self.adb, self.profile, self.db, candidates, dry_run=dialog.dry_run,
+        )
+        if from_mass:
+            self._start_mass_worker(worker, f"PvP cleanup — {'dry run' if dialog.dry_run else 'unfavoriting'}")
+        else:
+            self._start_decision_worker(worker, dry_run=dialog.dry_run, action="PvP cleanup")
+
     def _start_decision_worker(self, worker, *, dry_run=False, action="Favoriting"):
         self._apply_speed_settings()
         self.decision_tab.set_favoriting(True, dry_run=dry_run, action=action)
@@ -646,6 +715,9 @@ class MainWindow(QMainWindow):
         self._fav_result = None
         worker.progress.connect(lambda cur, total, message: self.decision_tab.on_fav_progress(cur, total, message)
                                 if worker is self._fav_worker and worker is not self._fav_completed_worker else None)
+        worker.action_progress.connect(lambda payload: self.decision_tab.on_action_progress(payload)
+                                       if worker is self._fav_worker
+                                       and worker is not self._fav_completed_worker else None)
         worker.error.connect(lambda message: self.decision_tab.on_fav_error(message)
                              if worker is self._fav_worker and worker is not self._fav_completed_worker else None)
         worker.finished.connect(lambda result: self._finish_decision_action(result, worker=worker))
@@ -759,6 +831,7 @@ class MainWindow(QMainWindow):
 
     def _start_mass_worker(self, worker, label):
         self._apply_speed_settings()
+        self.decision_tab.set_decision_editing_enabled(False)
         self._mass_worker = worker
         self._mass_stop_requested = False
         self._mass_completed_worker = None
@@ -766,6 +839,9 @@ class MainWindow(QMainWindow):
         worker.progress.connect(lambda cur, total, message: self.mass_tab.on_progress(cur, total, message)
                                 if worker is self._mass_worker
                                 and worker is not self._mass_completed_worker else None)
+        worker.action_progress.connect(lambda payload: self.mass_tab.on_action_progress(payload)
+                                       if worker is self._mass_worker
+                                       and worker is not self._mass_completed_worker else None)
         worker.error.connect(lambda message: self.mass_tab.on_error(message)
                              if worker is self._mass_worker
                              and worker is not self._mass_completed_worker else None)
@@ -791,6 +867,7 @@ class MainWindow(QMainWindow):
         if getattr(worker, 'dry_run', False) is True:
             self._mass_result['dry_run'] = True
         self._mass_completed_worker = worker
+        self.decision_tab.set_decision_editing_enabled(True)
         if not self._mass_result.get('dry_run'):
             self._refresh_collection()
             self._refresh_decisions()

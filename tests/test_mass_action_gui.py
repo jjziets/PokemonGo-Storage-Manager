@@ -1,5 +1,7 @@
 """Mass Actions keeps each initiating action's controls and outcome together."""
 
+# TRACEWEAVER: file-role=mass-action-gui-tests; req=REQ-MASS-001; trace=TRACE-MASS-001; verifies=VER-SCAN-001
+
 import os
 from types import MethodType, SimpleNamespace
 import unittest
@@ -24,6 +26,7 @@ class Event:
 def worker():
     result = Mock()
     result.progress, result.error, result.finished = Event(), Event(), Event()
+    result.action_progress = Event()
     result.isRunning.return_value = False
     result.start.side_effect = lambda: setattr(result.isRunning, 'return_value', True)
     return result
@@ -78,6 +81,10 @@ class MassActionRoutingTests(unittest.TestCase):
                 target.decision_tab.set_favoriting.assert_not_called()
                 action.progress.emit(3, 10, 'Checked Dragonite')
                 target.mass_tab.on_progress.assert_called_once_with(3, 10, 'Checked Dragonite')
+                payload = {'traversal_id': 2, 'checked': 3, 'phase': 'reading'}
+                action.action_progress.emit(payload)
+                target.mass_tab.on_action_progress.assert_called_once_with(payload)
+                target.decision_tab.on_action_progress.assert_not_called()
                 action.error.emit('Read held')
                 target.mass_tab.on_error.assert_called_once_with('Read held')
                 target.mass_tab.pause_btn.text.return_value = 'Pause'
@@ -135,13 +142,17 @@ class MassActionRoutingTests(unittest.TestCase):
         target.mass_tab.on_finished.assert_called_once_with({'favorited': 2, 'error': 'Device lost', 'aborted': True})
         stop_callback()
         self.assertEqual(target.mass_tab.on_finished.call_count, 1)
+        old.action_progress.emit({'phase': 'late after cleanup'})
+        target.mass_tab.on_action_progress.assert_not_called()
         target._start_mass_worker(new, 'New')
         target.mass_tab.reset_mock()
         old.progress.emit(10, 10, 'Old progress')
+        old.action_progress.emit({'phase': 'late after replacement'})
         old.error.emit('Old error')
         old.finished.emit({'favorited': 10})
         stop_callback()
         target.mass_tab.on_progress.assert_not_called()
+        target.mass_tab.on_action_progress.assert_not_called()
         target.mass_tab.on_error.assert_not_called()
         target.mass_tab.on_finished.assert_not_called()
         new.abort.assert_not_called()

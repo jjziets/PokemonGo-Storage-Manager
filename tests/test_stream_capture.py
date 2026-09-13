@@ -54,6 +54,68 @@ class StreamCaptureTests(unittest.TestCase):
         self.source.clock.map_pts_us.assert_called_once()
         self.assertEqual(started + 20_000_000, self.now)
 
+    def test_timeout_reports_no_publication_without_extra_frame_read(self):
+        self.source._last_sequence = 7
+        self.source.buffer.latest_sequence = 7
+        with self.assertRaises(StreamCaptureTimeout) as failure:
+            self.source.capture(timeout=0.02)
+        self.assertEqual({"reason": "no_new_frames", "latest_sequence": 7,
+                          "last_accepted_sequence": 7, "examined_frames": 0},
+                         failure.exception.details)
+        self.source.buffer.read.assert_not_called()
+        self.source.clock.map_pts_us.assert_not_called()
+
+    def test_timeout_distinguishes_old_source_from_recent_decoder_arrival(self):
+        started = self.now
+        old = self.frame(1, started - 500_000_000)
+        self.source.buffer.latest_sequence = 1
+        self.source.buffer.read.return_value = old
+        with self.assertRaises(StreamCaptureTimeout) as failure:
+            self.source.capture(timeout=0.02)
+        details = failure.exception.details
+        self.assertEqual("rejected_stale", details["reason"])
+        self.assertEqual([520.0, 520.0], details["source_age_ms"])
+        self.assertEqual(20.0, details["host_arrival_age_ms"])
+        self.assertEqual(-500.0, details["boundary_delta_ms"])
+        self.assertEqual(old.pts_us, details["pts_us"])
+        self.assertEqual(1, details["clock_generation"])
+        self.assertEqual(0, self.source._last_sequence)
+        self.source.buffer.read.assert_called_once_with(1)
+        self.source.clock.map_pts_us.assert_called_once()
+
+    def test_timeout_distinguishes_input_and_request_boundaries(self):
+        for age, expected in ((11_000_000, "rejected_preinput"),
+                              (1_000_000, "rejected_pre_request")):
+            with self.subTest(expected=expected):
+                self.source._after_ns = self.now - 10_000_000
+                self.source.buffer.latest_sequence = 1
+                self.source.buffer.read.return_value = self.frame(1, self.now - age)
+                with self.assertRaises(StreamCaptureTimeout) as failure:
+                    self.source.capture(timeout=0.02)
+                self.assertEqual(expected, failure.exception.details["reason"])
+                self.assertEqual(0, self.source._last_sequence)
+
+    def test_timeout_reports_slot_race_without_invented_source_age(self):
+        self.source.buffer.latest_sequence = 1
+        self.source.buffer.read.return_value = None
+        with self.assertRaises(StreamCaptureTimeout) as failure:
+            self.source.capture(timeout=0.02)
+        self.assertEqual("rejected_slot_race", failure.exception.details["reason"])
+        self.assertNotIn("source_age_ms", failure.exception.details)
+        self.assertNotIn("host_arrival_age_ms", failure.exception.details)
+        self.source.buffer.read.assert_called_once_with(1)
+        self.source.clock.map_pts_us.assert_not_called()
+
+    def test_timeout_reports_nonincreasing_pts_without_remapping(self):
+        self.source._last_pts_us = self.now // 1000
+        self.source.buffer.latest_sequence = 2
+        self.source.buffer.read.return_value = self.frame(2, self.now)
+        with self.assertRaises(StreamCaptureTimeout) as failure:
+            self.source.capture(timeout=0.02)
+        self.assertEqual("rejected_nonincreasing_pts", failure.exception.details["reason"])
+        self.assertNotIn("source_age_ms", failure.exception.details)
+        self.source.clock.map_pts_us.assert_not_called()
+
     def test_repeated_stale_sequence_is_copied_once_before_fresh_frame_arrives(self):
         started = self.now
         old, new = self.frame(1, started - 1_000_000), self.frame(2, started + 3_000_000)

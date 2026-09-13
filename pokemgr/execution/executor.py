@@ -10,6 +10,7 @@ retain stable membership. Identical stats never merge database rows.
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import json
 import logging
 import re
@@ -60,6 +61,51 @@ class _RefreshFavorites(Exception):
     """Discard carousel evidence and verify the remaining nonfavorite list."""
 
 
+@dataclass(frozen=True)
+class CleanupObservation:
+    """One independently validated position in a read-only batch traversal."""
+
+    key: tuple
+    star: str
+    exact_form: bool = True
+    possible_keys: frozenset = frozenset()
+    canonical_options: tuple = ()
+
+    @property
+    def compatible_keys(self):
+        return self.possible_keys or (frozenset((self.key,)) if self.exact_form else frozenset())
+
+    @property
+    def reviewed_options(self):
+        return self.canonical_options or ((frozenset((self.key,)),) if self.exact_form else ())
+
+    @property
+    def position_evidence(self):
+        # Star state may change; species evidence and all numerical stats may not.
+        return self.key, self.exact_form, self.compatible_keys, self.reviewed_options
+
+
+@dataclass
+class _CleanupProof:
+    pause_generation: int
+    source: tuple | None = None
+    source_seen: bool = False
+
+
+class _CleanupFavoriteStore:
+    """Keep known phone outcomes separate from conditional database writes."""
+
+    def __init__(self, executor, reviewed):
+        self.executor, self.reviewed = executor, reviewed
+
+    def update_favorited_many(self, ids, target):
+        if target is not False:
+            raise ValueError("Cleanup can only save verified OFF states")
+        rows = tuple(self.reviewed[pid] for pid in ids)
+        self.executor._validate_pvp_cleanup_review(rows)
+        self.executor.db.update_favorited_reviewed(rows, target=False)
+
+
 class Executor:
     """Set stars only on independently confirmed storage positions."""
 
@@ -78,11 +124,14 @@ class Executor:
         self.regions = profile.regions
         self._reader_threads = self._scanner._reader_threads
         self.on_progress: Callable | None = None
+        self.on_action_progress: Callable | None = None
         self.on_error: Callable | None = None
+        self._action_progress_state = None
         self._abort = self._paused = False
         self._current_flags = None
         self._favorite_sync = None
         self._star_confirmed = False
+        self._cleanup_star_guard = None
         self.nav.is_cancelled = lambda: self._abort or self._paused
         self.nav._observation_generation = lambda: self._scanner._pause_generation
 
@@ -110,6 +159,108 @@ class Executor:
             shiny=snapshot.shiny, shadow=snapshot.shadow, lucky=snapshot.lucky,
             is_dynamax=snapshot.is_dynamax,
         ))
+
+    @classmethod
+    def _cleanup_group_key(cls, row):
+        from .pvp_cleanup import cleanup_group_key
+        try:
+            key = cls._keeper_key(row)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return cleanup_group_key(key)
+
+    @staticmethod
+    @lru_cache(maxsize=2048)
+    def _cleanup_species_evidence(key, caught_family, candy_family, exact_form):
+        """Resolve finite compatible saved labels from authoritative evidence.
+
+        Display names never enter this resolver. Generic family aliases come
+        from GameMaster species names, not from a nickname or a string prefix.
+        """
+        from ..pvp.resolver import candidate_species_family, resolve_candidates
+
+        try:
+            result = resolve_candidates(key[3], key[4], key[5], hp=key[2], cp=key[1],
+                                        caught_family=caught_family or None,
+                                        candy_family=candy_family or None)
+        except Exception:
+            log.warning("Cleanup form candidates unavailable; preserving generic position as skip-only", exc_info=True)
+            return (frozenset((key,)), ()) if exact_form else (frozenset(), ())
+        candidates = [candidate for candidate in result.candidates
+                      if candidate.expected_cp == key[1] and candidate.expected_hp == key[2]
+                      and (not exact_form or candidate.species.strip().casefold() == key[0])]
+        possible = {key} if exact_form else set()
+        canonical_options = set()
+        for candidate in candidates:
+            canonical = (candidate.species.strip().casefold(), *key[1:])
+            options = {canonical}
+            family = candidate_species_family((candidate,))
+            if family:
+                options.add((family.strip().casefold(), *key[1:]))
+            possible.update(options)
+            canonical_options.add(frozenset(options))
+        return frozenset(possible), tuple(sorted(canonical_options, key=lambda item: repr(sorted(item))))
+
+    def _cleanup_observation(self, snapshot, decision, frame):
+        from .pvp_cleanup import cleanup_group_key
+        key = self._snapshot_keeper_key(snapshot)
+        if (cleanup_group_key(key) is None or snapshot.read_complete is not True
+                or not decision or decision.accepted is not True or type(decision.exact_form) is not bool):
+            raise RuntimeError("Cleanup held: batch position did not have a complete accepted identity")
+        possible, options = self._cleanup_species_evidence(
+            key, snapshot.caught_species.strip(), snapshot.candy_family.strip(), decision.exact_form)
+        return CleanupObservation(
+            key, favorite_state(frame, self.regions.favorite_star_region), decision.exact_form,
+            possible, options)
+
+    @staticmethod
+    def _cleanup_group_matches(observations, expected):
+        """Prove complete species-compatible coverage without assigning row IDs."""
+        slots = [key for key, count in expected.items() for _ in range(count)]
+        if len(observations) != len(slots):
+            return False
+        allowed = set(slots)
+        edges = []
+        for observation in observations:
+            possibilities = observation.reviewed_options
+            # A plausible assignment alone is insufficient: each unresolved
+            # form must itself be reviewed, or covered by a reviewed generic
+            # family label. An unreviewed third form remains protected.
+            if not possibilities or any(not (option & allowed) for option in possibilities):
+                return False
+            # Unknown form multiplicities cannot consume exact form rows. Only
+            # a reviewed generic-family slot covers every canonical option of
+            # a multi-form observation; each such slot is still used once.
+            compatible = set.intersection(*(set(option) for option in possibilities)) & allowed
+            if not compatible:
+                return False
+            edges.append(compatible)
+        assigned, owners = {}, {}
+        for start in range(len(observations)):
+            queue, seen, parents = [start], {start}, {}
+            free = None
+            for index in queue:
+                for slot, key in enumerate(slots):
+                    if slot in parents or key not in edges[index]:
+                        continue
+                    parents[slot] = index
+                    if slot not in owners:
+                        free = slot
+                        break
+                    owner = owners[slot]
+                    if owner not in seen:
+                        seen.add(owner)
+                        queue.append(owner)
+                if free is not None:
+                    break
+            if free is None:
+                return False
+            while free is not None:
+                index = parents[free]
+                previous = assigned.get(index)
+                assigned[index], owners[free] = free, index
+                free = previous
+        return True
 
     @classmethod
     def _selected_queries(cls, selected):
@@ -149,8 +300,362 @@ class Executor:
     def favorite_keepers(self, dry_run=False, selected_passes=None):
         try:
             return self._favorite_keepers(dry_run, selected_passes)
+        except Exception as exc:
+            self._update_action_progress("stopped" if self._abort else "error", note=str(exc))
+            raise
         finally:
             self._close_reader()
+            self._action_progress_state = None
+
+    def unfavorite_pvp_candidates(self, reviewed_candidates, dry_run=False, selected_passes=None):
+        """Remove only reviewed, still-eligible stars through exact live matches."""
+        from .pvp_cleanup import plan_pvp_cleanup
+
+        result = dict(unfavorited=0, checked=0, verified=0, skipped=0, unmatched=0,
+                      ambiguous=0, dry_run=bool(dry_run), db_synced=0,
+                      db_unresolved=0, partial=False, aborted=False)
+        self._favorite_sync = None
+        self._cleanup_star_guard = None
+        self._cleanup_proof_generation = None
+        self._cleanup_proof = None
+        self._cleanup_active_groups = None
+        remaining = Counter()
+        plan_started = False
+        try:
+            selected_queries = list(self._selected_queries(selected_passes))
+            reviewed = tuple(reviewed_candidates) if reviewed_candidates is not None else ()
+            result["unmatched"] = len(reviewed)
+            if not reviewed:
+                raise ValueError("Cleanup held: no reviewed candidates were supplied")
+            reviewed_plan = plan_pvp_cleanup(reviewed, self._keeper_key)
+            if reviewed_plan.eligible != len(reviewed):
+                raise ValueError("Cleanup held: reviewed candidates include protected or ambiguous records")
+            reviewed = reviewed_plan.candidates
+            reviewed_by_id = {row.id: row for row in reviewed}
+            if len(reviewed_by_id) != len(reviewed):
+                raise ValueError("Cleanup held: reviewed candidate IDs are not unique")
+            if self._abort:
+                result["aborted"] = True
+                return result
+            all_pokemon = self.db.get_all_for_cleanup()
+            plan = plan_pvp_cleanup(all_pokemon, self._keeper_key, selected_ids=set(reviewed_by_id))
+            result["ambiguous"] = plan.ambiguous
+            if {row.id for row in plan.candidates} != set(reviewed_by_id):
+                raise RuntimeError("Cleanup held: reviewed candidates changed or became protected/ambiguous; review again")
+            for current in plan.candidates:
+                before = reviewed_by_id[current.id]
+                if (self._keeper_key(current) != self._keeper_key(before)
+                        or current.scan_session_id != before.scan_session_id
+                        or current.decision != before.decision
+                        or current.favorited != before.favorited):
+                    raise RuntimeError("Cleanup held: a reviewed candidate changed; review again")
+            self._validate_cleanup_device(plan.candidates)
+
+            remaining = plan.remaining.copy()
+            plan_started = True
+            queries = list(self._keeper_queries(selected_passes, remaining))
+            selected_flags = {tuple(flags.values()) for _name, _query, flags in queries}
+            target_keys = {key for key in remaining if key[6:] in selected_flags}
+            target_total = sum(remaining[key] for key in target_keys)
+            selected_names = [name for name, _query in selected_queries]
+            self._action_progress_state = dict(
+                schema=1, action="unfavorite", target_state=False,
+                pass_name="", pass_index=0, pass_total=len(selected_names),
+                passes_completed=0, passes_remaining=len(selected_names),
+                selected_passes=selected_names, batch_index=0, traversal_index=0,
+                stage="starting_pass", current=0, total=0, checked_total=0,
+                cleanup_phase="verify", verified_total=0,
+                unfavorited_total=0, target_total=target_total, pending_total=target_total,
+                ambiguous_total=plan.ambiguous, dry_run=bool(dry_run),
+            )
+            if not dry_run:
+                # Include protected companions in the mapping. A selective
+                # pass never invokes FavoriteSync.complete_uniform_pass.
+                self._favorite_sync = FavoriteSync(
+                    _CleanupFavoriteStore(self, reviewed_by_id), all_pokemon, self._cleanup_group_key)
+            reviewed_groups = defaultdict(list)
+            for row in reviewed:
+                reviewed_groups[self._cleanup_group_key(row)].append(row)
+
+            def guard(snapshot):
+                if (self._paused or self._scanner._pause_generation != self._cleanup_proof_generation):
+                    raise RuntimeError("Cleanup held: pause invalidated the live uniqueness proof; review and run again")
+                key = self._snapshot_keeper_key(snapshot)
+                group = key[1:] if key else None
+                candidates = (self._cleanup_active_groups or {}).get(group)
+                if not candidates:
+                    raise RuntimeError("Cleanup held: live group was not fully reviewed and approved")
+                self._validate_pvp_cleanup_review(candidates)
+
+            self._cleanup_star_guard = guard
+            held_keys = set()
+            live_ambiguous = set()
+            for pass_index, pass_name in enumerate(selected_names, 1):
+                if not self._active():
+                    break
+                self._update_action_progress("starting_pass", pass_name=pass_name, pass_index=pass_index,
+                                             batch_index=0, traversal_index=0, current=0, total=0)
+                if self.on_progress:
+                    self.on_progress(0, 0, f"Pass {pass_index}/{len(selected_names)}: {pass_name} · reviewed PvP cleanup")
+                # Star state is absent from the query, so removing a star
+                # cannot change carousel membership. CP only narrows visits.
+                batch_index = 0
+                for flags, batch_keys, batch_queries in self._cleanup_batches(queries, remaining, pass_name):
+                    if not remaining or not self._active():
+                        break
+                    keys = {key for key in batch_keys if remaining[key] and key not in held_keys}
+                    if not keys:
+                        continue
+                    groups = {key[1:] for key in keys}
+                    self._validate_pvp_cleanup_review(tuple(row for group in groups for row in reviewed_groups[group]))
+                    batch_index += 1
+                    self._update_action_progress("starting_batch", batch_index=batch_index,
+                                                 traversal_index=1, current=0, total=0, cleanup_phase="verify")
+                    if not self._active():
+                        break
+                    self._cleanup_proof = _CleanupProof(self._scanner._pause_generation)
+                    self._cleanup_proof_generation = self._cleanup_proof.pause_generation
+                    manifests, live_groups = {}, defaultdict(list)
+                    # Inventory every result before considering any star. The
+                    # two max variants share the saved key, so both contribute
+                    # to uniqueness even if only one category was selected.
+                    for query, covers_variant, selected in batch_queries:
+                        self._check_cleanup_proof()
+                        total = self._open_pass(query, verify_count=True)
+                        self._check_cleanup_proof()
+                        if self._abort:
+                            break
+                        inventory = []
+                        outcome = self._run_pass(query, False, keepers=Counter(), flags=flags,
+                                                 opened_total=total, inventory=inventory)
+                        result["verified"] += outcome["checked"]
+                        self._update_action_progress(verified_total=result["verified"])
+                        if outcome.get("error"):
+                            raise RuntimeError(outcome["error"])
+                        if self._abort:
+                            break
+                        self._check_cleanup_proof()
+                        if len(inventory) != total or outcome["checked"] != total:
+                            raise RuntimeError("Cleanup held: batch inventory was incomplete")
+                        manifests[query] = tuple(inventory)
+                        if covers_variant:
+                            for item in inventory:
+                                live_groups[item.key[1:]].append(item)
+                    if self._abort:
+                        break
+                    assigned_groups = defaultdict(dict)
+                    for group in groups:
+                        expected = Counter(self._keeper_key(row) for row in reviewed_groups[group])
+                        observations = live_groups[group]
+                        # Every live member must have one compatible reviewed
+                        # counterpart; no particular DB row is assigned to a tap.
+                        compatible = self._cleanup_group_matches(observations, expected)
+                        selected_manifests = []
+                        if compatible:
+                            for query, _coverage, selected in batch_queries:
+                                if selected and self._cleanup_group_matches(
+                                        [item for item in manifests[query] if item.key[1:] == group], expected):
+                                    selected_manifests.append(query)
+                        # A group split between variants or selected passes
+                        # cannot reuse partial observations or persistence.
+                        if len(selected_manifests) == 1:
+                            assigned_groups[selected_manifests[0]][group] = tuple(reviewed_groups[group])
+                            live_ambiguous.discard(group)
+                        elif observations:
+                            in_current_scope = any(selected and any(item.key[1:] == group for item in manifests[query])
+                                                   for query, _coverage, selected in batch_queries)
+                            if not compatible:
+                                held_keys.update(expected)
+                            if not compatible or in_current_scope:
+                                live_ambiguous.add(group)
+                            self._update_action_progress("scanning", note=
+                                "Group not fully reviewed or form-compatible in this selected filter; left favorited")
+                    result["ambiguous"] = plan.ambiguous + sum(len(reviewed_groups[group]) for group in live_ambiguous)
+                    self._update_action_progress(ambiguous_total=result["ambiguous"])
+                    for query, _covers_variant, selected in batch_queries:
+                        if not selected or not self._active():
+                            continue
+                        manifest = manifests[query]
+                        authorized = assigned_groups[query]
+                        pending = Counter({group: len(rows) for group, rows in authorized.items()})
+                        if not pending:
+                            continue
+                        self._check_cleanup_proof()
+                        self._validate_pvp_cleanup_review(tuple(row for rows in authorized.values() for row in rows))
+                        self._cleanup_active_groups = authorized
+                        before = pending.copy()
+                        self._update_action_progress("starting_batch", cleanup_phase="dry_run" if dry_run else "unfavorite",
+                                                     traversal_index=1 if dry_run else 2, current=0, total=len(manifest))
+                        if self._abort:
+                            break
+                        self._check_cleanup_proof()
+                        if dry_run:
+                            # The full inventory already read live tri-state
+                            # stars. Unknown is unresolved, never presumed ON.
+                            for group in tuple(pending):
+                                observations = [item for item in manifest if item.key[1:] == group]
+                                if all(item.star in ("on", "off") for item in observations):
+                                    result["unfavorited"] += sum(item.star == "on" for item in observations)
+                                    del pending[group]
+                        else:
+                            total = self._open_pass(query, verify_count=True, expected_count=len(manifest))
+                            self._check_cleanup_proof()
+                            if self._abort:
+                                break
+                            outcome = self._run_pass(query, False, keepers=pending, flags=flags,
+                                                     opened_total=total, expected_manifest=manifest, cleanup_groups=True)
+                            for field in ("unfavorited", "checked", "skipped", "restarts"):
+                                result[field] = result.get(field, 0) + outcome.get(field, 0)
+                            if outcome.get("error"):
+                                result["error"] = outcome["error"]
+                        for group in before:
+                            if not pending[group]:
+                                # Exact rows remain unresolved until the whole
+                                # group has affirmative OFF readbacks and save.
+                                for key, consumed in Counter(self._keeper_key(row) for row in authorized[group]).items():
+                                    remaining[key] -= consumed
+                                    if not remaining[key]:
+                                        del remaining[key]
+                        self._update_action_progress("scanning", checked_total=result["checked"],
+                                                     unfavorited_total=result["unfavorited"],
+                                                     pending_total=sum(remaining[key] for key in target_keys))
+                        if result.get("error") or self._abort:
+                            break
+                    self._cleanup_proof = None
+                    self._cleanup_active_groups = None
+                    if result.get("error") or self._abort:
+                        break
+                if result.get("error") or self._abort:
+                    break
+                self._update_action_progress("pass_complete", passes_completed=pass_index,
+                                             passes_remaining=len(selected_names) - pass_index,
+                                             note="Nothing pending in this pass" if not batch_index else None)
+            result["unmatched"] = sum(remaining.values())
+        except Exception as exc:
+            result["error"] = str(exc)
+            log.exception("Selective PvP cleanup held")
+            if self.on_error:
+                try:
+                    self.on_error(str(exc))
+                except Exception:
+                    log.warning("Cleanup error observer failed", exc_info=True)
+        finally:
+            if plan_started:
+                result["unmatched"] = sum(remaining.values())
+            self._add_sync_result(result)
+            result["aborted"] = self._abort
+            result["partial"] = bool(result["checked"] or result["unfavorited"]) and bool(
+                result.get("error") or result["aborted"] or result["unmatched"] or result["db_unresolved"])
+            try:
+                self._close_reader()
+            except Exception as exc:
+                result["error"] = "; ".join(filter(None, (result.get("error"), f"Reader cleanup failed: {exc}")))
+                result["partial"] = bool(result["checked"] or result["unfavorited"])
+            finally:
+                self._update_action_progress("error" if result.get("error") else "stopped" if self._abort else "finished",
+                                             note=result.get("error"))
+                self._action_progress_state = None
+                self._cleanup_star_guard = None
+                self._cleanup_proof_generation = None
+                self._cleanup_proof = None
+                self._cleanup_active_groups = None
+        return result
+
+    def _validate_cleanup_device(self, rows):
+        serial = getattr(self.adb, "serial", None)
+        if not isinstance(serial, str) or not serial or serial != self.profile.serial:
+            raise RuntimeError("Cleanup held: connected device does not match the selected calibration")
+        sessions = {row.scan_session_id for row in rows}
+        fingerprints = self.db.get_session_device_fingerprints(sessions)
+        allowed = {self.profile.fingerprint, self.profile.legacy_fingerprint}
+        if any(fingerprints.get(session) not in allowed for session in sessions):
+            raise RuntimeError("Cleanup held: reviewed scan sessions do not match this device")
+
+    def _validate_pvp_cleanup_review(self, reviewed):
+        """Recheck current protections and full-group uniqueness without input."""
+        from .pvp_cleanup import plan_pvp_cleanup
+
+        current = self.db.get_all_for_cleanup()
+        by_id = {row.id: row for row in reviewed}
+        plan = plan_pvp_cleanup(current, self._keeper_key, selected_ids=set(by_id))
+        if {row.id for row in plan.candidates} != set(by_id):
+            raise RuntimeError("Cleanup held: reviewed candidate became protected, changed, or ambiguous")
+        for row in plan.candidates:
+            before = by_id[row.id]
+            if (self._keeper_key(row) != self._keeper_key(before)
+                    or row.scan_session_id != before.scan_session_id
+                    or row.decision != before.decision or row.favorited != before.favorited):
+                raise RuntimeError("Cleanup held: reviewed candidate changed")
+        self._validate_cleanup_device(plan.candidates)
+
+    @staticmethod
+    def _cleanup_batches(queries, remaining, pass_name):
+        """Plan stable CP chunks, with full coverage of collapsed max forms.
+
+        Selected query text is retained exactly for both traversals. A selected
+        Gigantamax query may also exclude dynamax due to pass deduplication;
+        its broader variant inventory then supplies uniqueness coverage, while
+        the narrower inventory supplies its own ordered action manifest.
+        """
+        groups = sorted({tuple(flags.values()) for name, _query, flags in queries if name == pass_name})
+        for values in groups:
+            flags = dict(zip(("shiny", "shadow", "lucky", "is_dynamax"), values))
+            selected_bases = list(dict.fromkeys(
+                query + "&!3*&!4*" for name, query, item_flags in queries
+                if name == pass_name and tuple(item_flags.values()) == values))
+            common = [("" if value else "!") + term for term, value in zip(("shiny", "shadow", "lucky"), values)]
+            variants = (("dynamax", "!gigantamax"), ("gigantamax",)) if values[3] else (("!dynamax", "!gigantamax"),)
+            bases = []
+            for variant in variants:
+                canonical = "&".join([*common, *variant, "!3*", "!4*"])
+                equivalent = next((query for query in selected_bases
+                                   if set(query.split("&")) == set(canonical.split("&"))), None)
+                bases.append((equivalent or canonical, True, equivalent is not None))
+            for query in selected_bases:
+                if not any(query == base for base, _coverage, _selected in bases):
+                    bases.append((query, False, True))
+            longest = max((base for base, _coverage, _selected in bases), key=len)
+            # Plan once against the longest prefix so every sibling uses the
+            # identical CP chunk and still fits the verified editor limit.
+            for batch in pending_cp_batches(longest, remaining, flags):
+                suffix = batch.query[len(longest):]
+                yield flags, batch.keys, [(base + suffix, coverage, selected)
+                                          for base, coverage, selected in bases]
+
+    def _update_action_progress(self, stage=None, *, note=None, **values):
+        """Publish detached status only; a UI observer cannot fail an action."""
+        state = getattr(self, "_action_progress_state", None)
+        if state is None:
+            return
+        state.update(values)
+        if stage is None:
+            return
+        state["stage"] = stage
+        callback = getattr(self, "on_action_progress", None)
+        if callback is not None:
+            payload = dict(state, selected_passes=list(state["selected_passes"]))
+            if note is not None:
+                payload["note"] = note
+            try:
+                callback(payload)
+            except Exception:
+                log.warning("Action progress observer failed", exc_info=True)
+
+    def _action_progress_counts(self):
+        state = getattr(self, "_action_progress_state", None) or {}
+        changes = "unfavorited_total" if state.get("action") == "unfavorite" else "favorited_total"
+        return tuple(state.get(key, 0) for key in ("checked_total", changes, "pending_total"))
+
+    def _update_keeper_progress_counts(self, result, base, initial, pending):
+        if initial is not None and pending is not None:
+            state = getattr(self, "_action_progress_state", None) or {}
+            changes = "unfavorited" if state.get("action") == "unfavorite" else "favorited"
+            self._update_action_progress(
+                checked_total=base[0] + result.get("checked", 0),
+                **{changes + "_total": base[1] + result.get(changes, 0)},
+                pending_total=base[2] - sum((initial - pending).values()),
+                current=result.get("checked", 0),
+            )
 
     # TRACEWEAVER: entrypoint=plan_keeper_favorites; req=REQ-MASS-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
     @classmethod
@@ -174,50 +679,101 @@ class Executor:
     def _favorite_keepers(self, dry_run, selected_passes):
         all_pokemon = self.db.get_all()
         plan = self.plan_keeper_favorites(all_pokemon)
-        if not plan.unstarred:
-            return {"favorited": 0, "checked": 0}
+        selected_names = [name for name, _query in self.ALL_FAV_PASSES
+                          if selected_passes is None or name in selected_passes]
+        self._action_progress_state = dict(
+            schema=1, pass_name="", pass_index=0, pass_total=len(selected_names),
+            passes_completed=0, passes_remaining=len(selected_names),
+            selected_passes=selected_names, batch_index=0, traversal_index=0,
+            stage="starting_pass", current=0, total=0, checked_total=0,
+            favorited_total=0, target_total=0, pending_total=0,
+            ambiguous_total=plan.ambiguous, dry_run=bool(dry_run),
+        )
         if self._abort:
+            self._update_action_progress("stopped")
             return {"favorited": 0, "checked": 0, "dry_run": dry_run, "aborted": True}
+        if not plan.unstarred:
+            for index, name in enumerate(selected_names, 1):
+                if self._abort:
+                    break
+                self._update_action_progress("starting_pass", pass_name=name, pass_index=index)
+                if self._abort:
+                    break
+                self._update_action_progress("pass_complete", passes_completed=index,
+                                             passes_remaining=len(selected_names) - index,
+                                             note="Nothing pending in this pass")
+            self._update_action_progress("stopped" if self._abort else "finished")
+            result = {"favorited": 0, "checked": 0}
+            if dry_run or self._abort:
+                result["dry_run"] = dry_run
+            if self._abort:
+                result["aborted"] = True
+            return result
         # Validate [] separately from None before inspecting the inventory.
         list(self._selected_queries(selected_passes))
         remaining = plan.remaining
         self._favorite_sync = None if dry_run else FavoriteSync(
             self.db, all_pokemon, self._keeper_key, changes_only=True)
         queries = list(self._keeper_queries(selected_passes, remaining))
+        selected_flags = {tuple(flags.values()) for _name, _query, flags in queries}
+        target_keys = {key for key in remaining if key[6:] in selected_flags}
+        target_total = sum(remaining[key] for key in target_keys)
+        self._update_action_progress(target_total=target_total, pending_total=target_total)
         blocked = plan.ambiguous
         self._write_log(all_pokemon)
         totals = dict(favorited=0, checked=0, skipped=0, dry_run=dry_run)
         # Include !favorite before batching so the complete search stays inside
         # the native editor's length limit. Build only still-pending CP groups.
-        batches = ((name, batch, flags) for name, query, flags in queries
-                   for batch in pending_cp_batches(query + "&!favorite", remaining, flags))
-        for name, batch, flags in batches:
-            if not remaining or not self._active():
+        for pass_index, pass_name in enumerate(selected_names, 1):
+            if self._abort:
                 break
-            pending = Counter({key: remaining[key] for key in batch.keys if remaining[key] > 0})
-            if not pending:
-                continue
-            before = pending.copy()
+            self._update_action_progress("starting_pass", pass_name=pass_name, pass_index=pass_index,
+                                         batch_index=0, traversal_index=0, current=0, total=0)
             if self.on_progress:
-                self.on_progress(0, 0, f"Pass: {name} · pending keeper CPs · excluding favorites")
-            log.info("Keeper CP batch: %d known occurrences, filter=%s", sum(pending.values()), batch.query)
-            result = self._run_favorite_pass(batch.query, pending, dry_run, plan.unstarred, flags=flags)
-            # Keep completed work even when a later position holds the pass.
-            # A local allowance also ends this batch as soon as it is exhausted.
-            for key, consumed in (before - pending).items():
-                remaining[key] -= consumed
-                if not remaining[key]:
-                    del remaining[key]
-            for key in ("favorited", "checked", "skipped", "restarts", "refreshes"):
-                totals[key] = totals.get(key, 0) + result.get(key, 0)
-            if result.get("error"):
-                totals["error"] = result["error"]
+                self.on_progress(0, 0, f"Pass {pass_index}/{len(selected_names)}: {pass_name} · pending keeper CPs · excluding favorites")
+            # Keep this lazy: earlier flag/variant queries can consume keys
+            # before a later query's CP groups are constructed.
+            batches = ((batch, flags) for name, query, flags in queries if name == pass_name
+                       for batch in pending_cp_batches(query + "&!favorite", remaining, flags))
+            batch_index = 0
+            for batch, flags in batches:
+                if not remaining or not self._active():
+                    break
+                pending = Counter({key: remaining[key] for key in batch.keys if remaining[key] > 0})
+                if not pending:
+                    continue
+                before = pending.copy()
+                batch_index += 1
+                self._update_action_progress("starting_batch", batch_index=batch_index,
+                                             traversal_index=1, current=0, total=0)
+                log.info("Keeper CP batch: %d known occurrences, filter=%s", sum(pending.values()), batch.query)
+                result = self._run_favorite_pass(batch.query, pending, dry_run, plan.unstarred, flags=flags)
+                # Keep completed work even when a later position holds the pass.
+                # A local allowance also ends this batch as soon as it is exhausted.
+                for key, consumed in (before - pending).items():
+                    remaining[key] -= consumed
+                    if not remaining[key]:
+                        del remaining[key]
+                for key in ("favorited", "checked", "skipped", "restarts", "refreshes"):
+                    totals[key] = totals.get(key, 0) + result.get(key, 0)
+                self._update_action_progress(checked_total=totals["checked"],
+                                             favorited_total=totals["favorited"],
+                                             pending_total=sum(remaining[key] for key in target_keys))
+                if result.get("error"):
+                    totals["error"] = result["error"]
+                    break
+            if totals.get("error") or self._abort:
                 break
+            self._update_action_progress("pass_complete", passes_completed=pass_index,
+                                         passes_remaining=len(selected_names) - pass_index,
+                                         note="Nothing pending in this pass" if not batch_index else None)
         totals.update(unmatched=sum(remaining.values()) + blocked, ambiguous=blocked,
                       aborted=self._abort)
         if blocked:
             totals["note"] = "Some keeper records have incomplete stats, conflicting decisions, or indistinguishable occurrences across scan sessions. These matches need review."
         self._add_sync_result(totals)
+        self._update_action_progress("error" if totals.get("error") else "stopped" if self._abort else "finished",
+                                     note=totals.get("error"))
         return totals
 
     def _run_favorite_pass(self, search_query, keeper_set, dry_run, total_keepers, *, flags=None):
@@ -233,12 +789,17 @@ class Executor:
                                   keepers=keeper_set, flags=flags)
         totals = dict(favorited=0, checked=0, skipped=0, restarts=0, refreshes=0)
         expected_count = None
+        progress_base = self._action_progress_counts()
+        initial_pending = keeper_set.copy()
+        traversal_index = 1
         try:
             self.reader.prepare_native_ocr()
             while self._active():
+                self._update_action_progress(traversal_index=traversal_index, current=0, total=0)
                 total = self._open_pass(
                     search_query, verify_count=True, nonfavorite=True,
                     expected_count=expected_count, open_appraisal=bool(keeper_set))
+                self._update_action_progress("scanning", current=0, total=total)
                 if self._abort or not total or not keeper_set:
                     break
                 result = self._run_pass(search_query, True, dry_run=dry_run,
@@ -246,6 +807,8 @@ class Executor:
                                         nonfavorite=True, opened_total=total)
                 for key in ("favorited", "checked", "skipped", "restarts"):
                     totals[key] += result.get(key, 0)
+                self._update_keeper_progress_counts(totals, progress_base, initial_pending, keeper_set)
+                self._update_action_progress(current=result.get("checked", 0))
                 if result.get("error"):
                     totals["error"] = result["error"]
                     break
@@ -258,6 +821,8 @@ class Executor:
                     break
                 expected_count = total - changes
                 totals["refreshes"] += 1
+                self._update_action_progress("refreshing")
+                traversal_index += 1
                 log.info("Refreshing nonfavorite filter after %d changes; expected %d remaining",
                          changes, expected_count)
                 if self.on_progress:
@@ -299,6 +864,12 @@ class Executor:
         self._star_confirmed = True
         sync = getattr(self, "_favorite_sync", None)
         if sync is not None:
+            groups = getattr(self, "_cleanup_active_groups", None)
+            if groups is not None and target is False:
+                key = self._snapshot_keeper_key(snapshot)
+                group = key[1:] if key else None
+                sync.observe(group if group in groups else None, target)
+                return
             key = (self._snapshot_keeper_key(snapshot)
                    if cp_decision is not None and cp_decision.exact_form else None)
             sync.observe(key, target)
@@ -433,8 +1004,24 @@ class Executor:
         return AppraisalSnapshot.from_reads(detail, appraisal)
 
     def _check_generation(self, generation):
+        self._check_cleanup_proof()
         if self._paused or self._scanner._pause_generation != generation:
             raise _ReacquireAction()
+
+    def _check_cleanup_proof(self, frame=None):
+        proof = getattr(self, "_cleanup_proof", None)
+        if proof is None:
+            return
+        if self._paused or self._scanner._pause_generation != proof.pause_generation:
+            raise RuntimeError("Cleanup held: pause invalidated the live uniqueness proof; review and run again")
+        if frame is not None:
+            # Compatible clock refreshes retain continuity, even though the
+            # numeric clock mapping revision changes during a long carousel.
+            source = tuple(frame.info.get(name) for name in (
+                "pokemgr_stream_session", "pokemgr_source_clock_continuity"))
+            if proof.source_seen and source != proof.source:
+                raise RuntimeError("Cleanup held: capture source continuity changed during batch verification")
+            proof.source, proof.source_seen = source, True
 
     def _gym_skip_identity(self, snapshot):
         """A visible gym defender can authorize a skip, never a keeper match."""
@@ -599,6 +1186,7 @@ class Executor:
             frame = scanner._fast_screencap()
             if self._abort:
                 return None
+            self._check_cleanup_proof(frame)
             unseen = new_observation(frame)
             fresh = self._read_identity(frame)
             if self._abort:
@@ -679,6 +1267,13 @@ class Executor:
         self._check_generation(generation)
         if self._abort:
             return False, frame
+        cleanup_guard = getattr(self, "_cleanup_star_guard", None)
+        if cleanup_guard is not None:
+            self._check_cleanup_proof(frame)
+            cleanup_guard(snapshot)
+            self._check_generation(generation)
+            if self._abort:
+                return False, frame
         if state == desired:
             if nonfavorite:
                 # This may be a retained carousel card after its list member
@@ -713,6 +1308,7 @@ class Executor:
             frame = scanner._fast_screencap()
             if self._abort:
                 return False, frame
+            self._check_cleanup_proof(frame)
             fresh = self._read_identity(frame)
             if self._abort:
                 return False, frame
@@ -764,6 +1360,7 @@ class Executor:
             fresh = scanner._fast_screencap()
             if self._abort:
                 return False
+            self._check_cleanup_proof(fresh)
             unseen = new_observation(fresh)
             current = self._read_identity(fresh)
             if self._abort:
@@ -843,7 +1440,8 @@ class Executor:
         return False
 
     def _run_pass(self, query, target, *, dry_run=False, keepers=None, flags=None,
-                  nonfavorite=False, opened_total=None):
+                  nonfavorite=False, opened_total=None, inventory=None, expected_manifest=None,
+                  cleanup_groups=False):
         count_key = "favorited" if target else "unfavorited"
         result = {count_key: 0, "checked": 0, "skipped": 0, "restarts": 0}
         scanner = self._scanner
@@ -851,10 +1449,27 @@ class Executor:
         previous_frame = previous_snapshot = None
         transition = False
         initial_keepers = keepers.copy() if keepers is not None else None
+        progress_base = self._action_progress_counts()
         changed_occurrences = Counter()
         restart_attempted = False
-        sync = getattr(self, "_favorite_sync", None) if not dry_run else None
+        inventory_mode = inventory is not None
+        strict_cleanup = inventory_mode or expected_manifest is not None
+        verified_base = (getattr(self, "_action_progress_state", None) or {}).get("verified_total", 0)
+        sync = getattr(self, "_favorite_sync", None) if not dry_run and not inventory_mode else None
         phase = "open"
+
+        def publish_counts():
+            if inventory_mode:
+                self._update_action_progress(verified_total=verified_base + result["checked"],
+                                             current=result["checked"])
+            elif cleanup_groups:
+                completed = sum(count for group, count in initial_keepers.items() if not keepers[group])
+                self._update_action_progress(checked_total=progress_base[0] + result["checked"],
+                                             unfavorited_total=progress_base[1] + result[count_key],
+                                             pending_total=progress_base[2] - completed,
+                                             current=result["checked"])
+            else:
+                self._update_keeper_progress_counts(result, progress_base, initial_keepers, keepers)
 
         def clear_traversal():
             nonlocal previous_frame, previous_snapshot, transition
@@ -872,10 +1487,22 @@ class Executor:
         try:
             if not self._active():
                 return result | {"aborted": True}
+            if strict_cleanup:
+                self._check_cleanup_proof()
+                if target is not False or keepers is None or opened_total is None or nonfavorite:
+                    raise ValueError("Cleanup traversal requires an exact stable opened filter")
+                if inventory_mode and (inventory or expected_manifest is not None):
+                    raise ValueError("Cleanup inventory must start empty without an action manifest")
+                if expected_manifest is not None and len(expected_manifest) != opened_total:
+                    raise ValueError("Cleanup manifest must cover every verified filtered position")
+            if cleanup_groups and (not strict_cleanup or inventory_mode or not self._cleanup_active_groups):
+                raise ValueError("Cleanup group traversal requires an approved ordered group manifest")
             self.reader.prepare_native_ocr()
             if nonfavorite and (keepers is None or target is not True or opened_total is None):
                 raise ValueError("Nonfavorite lap requires a verified keeper filter")
-            total = opened_total if nonfavorite else (
+            if opened_total is not None and (type(opened_total) is not int or not 0 <= opened_total <= 10000):
+                raise ValueError("Action requires an independently verified opened count")
+            total = opened_total if opened_total is not None else (
                 self._open_pass(query, verify_count=True) if keepers is not None or sync is not None
                 else self._open_pass(query))
             self._current_flags = flags
@@ -884,7 +1511,10 @@ class Executor:
             while result["checked"] < total and self._active():
                 try:
                     phase = "read"
+                    if strict_cleanup:
+                        self._check_cleanup_proof()
                     gym_skip = False
+                    observation = None
                     generation = scanner._pause_generation
                     decision = None
                     if keepers is None:
@@ -894,11 +1524,15 @@ class Executor:
                             previous_accepted=previous_frame, require_transition=transition,
                         )
                         if kind == "reacquire":
+                            if strict_cleanup:
+                                raise RuntimeError("Cleanup held: inventory position evidence was invalidated")
                             continue
                         if kind == "transition_returned_to_previous":
                             self._check_generation(generation)
                             if self._abort:
                                 break
+                            if strict_cleanup:
+                                raise RuntimeError("Cleanup held: batch advance was not confirmed; no inventory or action restart")
                             if nonfavorite:
                                 # A changed membership invalidates every old
                                 # ordinal/backtracking checkpoint in this lap.
@@ -944,6 +1578,8 @@ class Executor:
                         if self._abort:
                             break
                         if decision is None:
+                            if strict_cleanup:
+                                raise RuntimeError(f"Cleanup held: incomplete batch identity: {reason}")
                             if kind != "invalid" or frame is None:
                                 raise RuntimeError(f"Action held: {reason}")
                             # Unresolved CP cannot authorize a keeper star, but
@@ -963,8 +1599,19 @@ class Executor:
                     # A generic family is sufficient for collection scanning,
                     # but cannot authorize an exact-form keeper action.
                     match_key = self._snapshot_keeper_key(snapshot) if decision and decision.exact_form else None
+                    if strict_cleanup:
+                        self._check_cleanup_proof(frame)
+                        observation = self._cleanup_observation(snapshot, decision, frame)
+                        if (expected_manifest is not None
+                                and observation.position_evidence != expected_manifest[result["checked"]].position_evidence):
+                            raise RuntimeError("Cleanup held: ordered batch identity changed before star input")
+                        if cleanup_groups:
+                            match_key = observation.key[1:]
                     matches = keepers is None or (match_key is not None and keepers[match_key] > 0)
-                    if matches:
+                    if inventory_mode:
+                        inventory.append(observation)
+                        self._check_cleanup_proof()
+                    elif matches:
                         change_options = {}
                         if nonfavorite:
                             change_options["nonfavorite"] = True
@@ -992,17 +1639,26 @@ class Executor:
                 except _ReacquireAction:
                     if phase == "star" and self._star_input_sent:
                         raise RuntimeError("Action held: pause interrupted star input; outcome is uncertain")
+                    if strict_cleanup:
+                        raise RuntimeError("Cleanup held: pause invalidated the live uniqueness proof; review and run again")
                     if nonfavorite and result[count_key] and not dry_run:
                         raise _RefreshFavorites("Pause invalidated the changed carousel")
                     continue
                 phase = "progress"
                 result["checked"] += 1
+                publish_counts()
+                if keepers is not None:
+                    self._update_action_progress("scanning", total=total)
                 if self.on_progress:
                     summary = snapshot.caught_species or snapshot.detected_species or "Unknown species"
                     self.on_progress(result["checked"], total,
                                      f"#{result['checked']} {summary} HP{snapshot.hp} "
                                      f"{snapshot.atk}/{snapshot.def_}/{snapshot.sta} · {count_key}: {result[count_key]}"
                                      + (f" · restart {result['restarts']}/1" if result["restarts"] else "")
+                                     + (" · form unresolved; left favorited" if strict_cleanup and not inventory_mode
+                                        and not matches and not decision.exact_form else "")
+                                     + (" · group not approved; left favorited" if strict_cleanup and not inventory_mode
+                                        and not matches and decision.exact_form else "")
                                      + (" (dry run)" if dry_run else ""))
                 scanner._previous_validated_identity_key = scanner._last_validated_identity_key
                 scanner._last_validated_identity_key = scanner._complete_identity_key(snapshot) if decision else None
@@ -1012,7 +1668,8 @@ class Executor:
                 )
                 scanner._last_accepted_pause_generation = generation if decision else None
                 previous_frame, previous_snapshot = frame, snapshot
-                if result["checked"] >= total or (keepers is not None and not keepers) or not self._active():
+                if (result["checked"] >= total
+                        or (not strict_cleanup and keepers is not None and not keepers) or not self._active()):
                     break
                 scanner._last_stable_image = frame
                 self._action_position = result["checked"]
@@ -1024,6 +1681,10 @@ class Executor:
                     raise RuntimeError("Action held: could not advance from confirmed appraisal")
                 previous_frame = scanner._last_stable_image
                 transition = True
+            if strict_cleanup:
+                self._check_cleanup_proof()
+                if not self._abort and result["checked"] != total:
+                    raise RuntimeError("Cleanup held: batch traversal did not cover the complete verified count")
             if (sync is not None and keepers is None and not self._abort
                     and total > 0 and result["checked"] == total):
                 sync.complete_uniform_pass(query, target)
@@ -1043,9 +1704,13 @@ class Executor:
                 result["error"] = str(exc)
                 log.exception("Mass action held")
                 if self.on_error:
-                    self.on_error(str(exc))
+                    try:
+                        self.on_error(str(exc))
+                    except Exception:
+                        log.warning("Action error observer failed", exc_info=True)
         finally:
             self._current_flags = None
+            publish_counts()
         result["aborted"] = self._abort
         if keepers is None:
             self._add_sync_result(result)

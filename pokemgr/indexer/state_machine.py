@@ -106,6 +106,7 @@ class IndexingStateMachine:
         self._previous_validated_identity_key: tuple | None = None
         self._transition_required = False
         self._settled_frame_pair = None
+        self._appraisal_settle_failure = None  # diagnostic pixels, never acquisition proof
         self._pause_generation = 0
         self._reader_threads = []
 
@@ -446,6 +447,23 @@ class IndexingStateMachine:
             transition_pair = settled_pair
             self._settled_frame_pair = None
             if frame is None:
+                if self._abort:
+                    return None, last_frame, "aborted", "abort requested"
+                if self._paused or self._pause_generation != pair_pause_generation:
+                    return None, None, "reacquire", "pause invalidated appraisal settling"
+                if status == "appraisal_not_stable":
+                    if attempt < 2:
+                        log.info(
+                            "Appraisal did not settle in acquisition %d/3; taking fresh observations without input",
+                            attempt + 1,
+                        )
+                        # Preserve the original transition reference and all
+                        # recovery state. Failed pixels never become a pair or
+                        # count as a read of this position.
+                        continue
+                    if save_failure_evidence:
+                        self._save_appraisal_settle_failure()
+                    return None, last_frame, status, "appraisal not stable after 3 acquisition attempts"
                 return None, last_frame, status, status.replace("_", " ")
             if iv_reacquisition is not None:
                 if self._abort:
@@ -535,6 +553,10 @@ class IndexingStateMachine:
                 return None, frame, "aborted", "abort requested"
             if force_confirmation and cp_recovery_attempted:
                 return None, frame, "cp_recovery_failed", "IV reacquisition did not independently confirm CP"
+            if (cp_recovery_attempted and decision.accepted
+                    and decision.cp_source.startswith("calculated")
+                    and not calculated_pair_confirmed):
+                return None, frame, "cp_recovery_failed", "calculated CP lacks independent confirmation after earlier recovery"
             if (
                 not cp_recovery_attempted
                 and not calculated_pair_confirmed
@@ -669,6 +691,8 @@ class IndexingStateMachine:
                     confirmation_frame = self._fast_screencap()
                     if self._abort:
                         return None, confirmation_frame, "aborted", "abort requested"
+                    if self._paused or self._pause_generation != pair_pause_generation:
+                        return None, None, "reacquire", "pause invalidated transition confirmation"
                     if (
                         self.nav.detect_screen(confirmation_frame) != "appraisal"
                         or not self.reader.are_bars_visible(confirmation_frame)
@@ -680,20 +704,26 @@ class IndexingStateMachine:
                             "unobserved transition confirmation lost the "
                             "appraisal screen",
                         )
-                    if not appraisal_frames_stable(frame, confirmation_frame):
-                        return (
-                            None,
-                            confirmation_frame,
-                            "transition_identity_inconsistent",
-                            "unobserved transition confirmation frames did not "
-                            "stay settled",
+                    if (not self._specimen_frame_sources_ordered(frame, confirmation_frame)
+                            or not appraisal_frames_stable(frame, confirmation_frame)):
+                        renewed, renewed_frame, kind, reason = self._revalidate_unobserved_transition(
+                            decision, (frame, confirmation_frame),
+                            pair_pause_generation, recovery_identity,
                         )
+                        if kind != "ok":
+                            return renewed, renewed_frame, kind, reason
+                        if current_key == previous_key:
+                            return (None, renewed_frame, "transition_returned_to_previous",
+                                    "transition returned to the same validated tuple")
+                        return renewed, renewed_frame, kind, reason
 
                     confirmation_detail, confirmation_appraisal = (
                         self._read_appraisal_snapshot(confirmation_frame)
                     )
                     if self._abort:
                         return None, confirmation_frame, "aborted", "abort requested"
+                    if self._paused or self._pause_generation != pair_pause_generation:
+                        return None, None, "reacquire", "pause invalidated transition confirmation"
                     confirmation_snapshot = AppraisalSnapshot.from_reads(
                         confirmation_detail,
                         confirmation_appraisal,
@@ -805,6 +835,97 @@ class IndexingStateMachine:
         if iv_pair_pending:
             return None, last_frame, "cp_recovery_failed", last_reason
         return None, last_frame, "invalid", last_reason
+
+    def _revalidate_unobserved_transition(self, expected, discarded_frames,
+                                          pause_generation, recovery_identity):
+        """Replace an unsettled/mixed pair with bounded, read-only exact proof.
+
+        No image from the failed proof is reused. Two new captures must have
+        compatible source evidence and independently reproduce the same complete
+        tuple; this never extends stream continuity across a JPEG fallback.
+        """
+        from dataclasses import replace
+        from .snapshot import AppraisalSnapshot, appraisal_frames_stable
+
+        expected_key = self._complete_identity_key(expected.snapshot)
+        discarded = list(discarded_frames)
+        last_frame = discarded[-1]
+        reason = "unobserved transition needs a fresh settled pair"
+        self._settled_frame_pair = None
+
+        def interruption():
+            if self._abort:
+                return None, last_frame, "aborted", "abort requested"
+            if self._paused or self._pause_generation != pause_generation:
+                return None, None, "reacquire", "pause invalidated transition revalidation"
+            return None
+
+        for attempt in range(3):
+            if interrupted := interruption():
+                return interrupted
+            requested_at = time.monotonic()
+            older = self._fast_screencap()
+            last_frame = older
+            if interrupted := interruption():
+                return interrupted
+            human_delay(.2, .2)
+            if interrupted := interruption():
+                return interrupted
+            newest = self._fast_screencap()
+            last_frame = newest
+            if interrupted := interruption():
+                return interrupted
+            pair = (older, newest)
+            bounds = tuple(image.info.get(name) for image in pair
+                           for name in ("pokemgr_capture_started_at", "pokemgr_capture_finished_at"))
+            fresh = (older is not newest
+                     and not any(image is old for image in pair for old in discarded)
+                     and all(image.size == discarded[0].size for image in pair)
+                     and all(type(value) in (int, float) and math.isfinite(value) for value in bounds)
+                     and 0 < requested_at < bounds[0] <= bounds[1] < bounds[2] <= bounds[3]
+                     and self._specimen_frame_sources_ordered(older, newest))
+            discarded.extend(pair)
+            if not fresh:
+                reason = "replacement transition pair was not independently fresh and source-compatible"
+                continue
+            appraisal_visible = all(self.nav.detect_screen(image) == "appraisal"
+                                    and self.reader.are_bars_visible(image) for image in pair)
+            if interrupted := interruption():
+                return interrupted
+            if (not appraisal_visible or not appraisal_frames_stable(*pair)
+                    or not self.reader.appraisal_bars_stable(*pair)):
+                reason = "replacement transition pair did not stay settled on appraisal"
+                continue
+            renewed = None
+            for image in pair:
+                detail, appraisal = self._read_appraisal_snapshot(image)
+                if interrupted := interruption():
+                    return interrupted
+                snapshot = AppraisalSnapshot.from_reads(detail, appraisal)
+                if expected.cp_source in {"screen_after_animation", "screen_after_powerup_preview"}:
+                    try:
+                        renewed = self._apply_animation_cp(
+                            snapshot, expected.snapshot.cp, recovery_identity, frame=image,
+                        )
+                    except RuntimeError as exc:
+                        return None, image, "transition_identity_inconsistent", str(exc)
+                    if renewed.accepted:
+                        renewed = replace(renewed, cp_source=expected.cp_source, reason=expected.reason)
+                else:
+                    renewed = self._validate_appraisal_snapshot(snapshot, image)
+                if interrupted := interruption():
+                    return interrupted
+                if not renewed.accepted or renewed.snapshot is None:
+                    return (None, image, "transition_identity_incomplete",
+                            "replacement transition tuple was not exact: " + renewed.reason)
+                if expected_key is None or self._complete_identity_key(renewed.snapshot) != expected_key:
+                    return (None, image, "transition_identity_inconsistent",
+                            "replacement transition tuple did not agree with the original exact tuple")
+            log.info("Unobserved transition confirmed by a new settled pair (%d/3): %s",
+                     attempt + 1, expected_key)
+            return renewed, newest, "ok", renewed.reason
+        return (None, last_frame, "transition_identity_inconsistent",
+                reason + " after 3 read attempts")
 
     @staticmethod
     def _independent_frame_sources(older, newest):
@@ -1134,6 +1255,36 @@ class IndexingStateMachine:
             log.info("Saved %s failure evidence: %s", phase, prefix)
         except (OSError, ValueError):
             log.exception("Could not save skipped-position evidence")
+
+    def _save_appraisal_settle_failure(self):
+        """Archive failed comparisons separately; never return them as usable reads."""
+        evidence = self._appraisal_settle_failure
+        if (not isinstance(evidence, dict)
+                or evidence.get("pause_generation") != self._pause_generation
+                or self._abort or self._paused):
+            return
+        import json
+        reason = "appraisal not stable after 3 acquisition attempts"
+        for phase, frame in zip(("settle_before", "settle_after"), evidence["frames"]):
+            self._save_failed_appraisal(frame, reason, phase=phase)
+        try:
+            position = max(0, int(self.skip_first_n)) + self.visited_count + 1
+            destination = config.CACHE_DIR / "scan_failures" / self.session_id
+            destination.mkdir(parents=True, exist_ok=True)
+            source_keys = (
+                "pokemgr_capture_started_at", "pokemgr_capture_finished_at",
+                "pokemgr_stream_session", "pokemgr_stream_sequence",
+                "pokemgr_stream_pts_us", "pokemgr_source_clock_generation",
+            )
+            metadata = {key: value for key, value in evidence.items() if key != "frames"}
+            metadata.update(position=position, reason=reason, diagnostic_only=True,
+                            sources=[{key: frame.info.get(key) for key in source_keys}
+                                     for frame in evidence["frames"]])
+            (destination / f"position_{position:05d}_settle.json").write_text(
+                json.dumps(metadata, indent=2, allow_nan=False), encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError):
+            log.exception("Could not save appraisal-settle diagnostics")
 
     @staticmethod
     def _cp_recovery_identity(snapshot) -> tuple | None:
@@ -2044,12 +2195,14 @@ class IndexingStateMachine:
         )
 
         self._settled_frame_pair = None
+        self._appraisal_settle_failure = None
         pair_pause_generation = self._pause_generation
         previous = current = None
         transition_seen = not require_transition
         returned_to_previous = False
         last_screen = "unknown"
         attempts = 0
+        last_comparison = None
 
         def interrupted():
             return (self._abort or self._paused
@@ -2067,21 +2220,33 @@ class IndexingStateMachine:
                 transition_seen = appraisal_transition_observed(previous_accepted, image)
 
         def compare_pair(attempt):
-            nonlocal returned_to_previous
+            nonlocal returned_to_previous, last_comparison
             previous_has_bars = self.reader.are_bars_visible(previous)
             current_has_bars = self.reader.are_bars_visible(current)
+            diffs = None
+            bars_stable = None
             if previous_has_bars and current_has_bars:
                 with timing.span("screen.region_diffs"):
                     diffs = appraisal_region_diffs(previous, current)
-                log.debug(
-                    "Appraisal settle %d/6: diffs=%s transition=%s",
-                    attempt, ",".join(f"{value:.2f}" for value in diffs), transition_seen,
-                )
-                with timing.span("screen.stability"):
-                    frames_stable = (
-                        max(diffs) <= 1.5
-                        and self.reader.appraisal_bars_stable(previous, current)
-                    )
+                if max(diffs) <= 1.5:
+                    with timing.span("screen.stability"):
+                        bars_stable = bool(self.reader.appraisal_bars_stable(previous, current))
+                frames_stable = max(diffs) <= 1.5 and bars_stable
+            else:
+                frames_stable = False
+            log.debug(
+                "Appraisal settle %d/6: diffs=%s transition=%s bars_visible=%s/%s narrow_bars_stable=%s",
+                attempt, ",".join(f"{value:.2f}" for value in diffs) if diffs else "unavailable",
+                transition_seen, previous_has_bars, current_has_bars, bars_stable,
+            )
+            last_comparison = {
+                "frames": (previous, current), "comparison": attempt,
+                "diffs": [value if math.isfinite(value) else None for value in diffs] if diffs else None,
+                "bars_visible": [bool(previous_has_bars), bool(current_has_bars)],
+                "narrow_bars_stable": bars_stable, "transition_seen": transition_seen,
+                "pause_generation": pair_pause_generation,
+            }
+            if previous_has_bars and current_has_bars:
                 if frames_stable:
                     settled_identity_changed = (
                         not require_transition or
@@ -2107,6 +2272,13 @@ class IndexingStateMachine:
                 return None, "transition_not_observed"
             if returned_to_previous:
                 return None, "transition_returned_to_previous"
+            if not interrupted() and last_comparison is not None:
+                self._appraisal_settle_failure = dict(last_comparison, last_screen=last_screen)
+                log.warning(
+                    "Appraisal settle exhausted: last comparison=%s diffs=%s bars_visible=%s narrow_bars_stable=%s",
+                    last_comparison["comparison"], last_comparison["diffs"],
+                    last_comparison["bars_visible"], last_comparison["narrow_bars_stable"],
+                )
             return None, "appraisal_not_stable"
 
         if require_transition and previous_accepted is None:
@@ -2117,6 +2289,7 @@ class IndexingStateMachine:
             # invalidated window falls back to fresh captures, never its pixels.
             for _window in range(6):
                 previous = current = None
+                last_comparison = None
                 last_source_image = None
                 status = None
                 valid_window = True
@@ -2188,6 +2361,7 @@ class IndexingStateMachine:
         # six-attempt budget. Discard all stream transition/pair evidence first.
         if self._abort:
             return None, "aborted"
+        last_comparison = None
         previous = self._fast_screencap()
         transition_seen = not require_transition
         observe_transition(previous)
@@ -2311,22 +2485,31 @@ class IndexingStateMachine:
             (True, previous_key, "previous"),
             (False, last_key, "restored"),
         ):
-            if self._abort:
-                return stopped("abort requested")
-            frame = self._fast_screencap()
-            if self._abort:
-                return stopped("abort requested")
-            if self.nav.detect_screen(frame) != "appraisal":
-                return stopped(f"failed-swipe recovery lost appraisal before {checkpoint} checkpoint")
-            if reverse:
-                moved = self._safe_swipe(
-                    *self.regions.swipe_end, *self.regions.swipe_start,
-                    self.regions.swipe_duration_ms, jitter=0,
-                )
-            else:
-                moved = self._fast_swipe()
-            if not moved:
+            while not self._abort:
+                while self._paused and not self._abort:
+                    with timing.span("wait.pause", session_id=self.session_id):
+                        time.sleep(0.25)
+                if self._abort:
+                    return stopped("abort requested")
+                generation = self._pause_generation
+                frame = self._fast_screencap()
+                if self._abort:
+                    return stopped("abort requested")
+                screen = self.nav.detect_screen(frame)
+                if self._paused or self._pause_generation != generation:
+                    continue
+                if screen != "appraisal":
+                    return stopped(f"failed-swipe recovery lost appraisal before {checkpoint} checkpoint")
+                moved = self._advance_appraisal(frame, reverse=reverse, pause_generation=generation)
+                if moved:
+                    break
+                if self._paused or self._pause_generation != generation:
+                    # No input was sent. Reobserve this phase after resume;
+                    # once dispatched, its gesture can never be repeated.
+                    continue
                 return stopped(f"failed-swipe recovery could not reach {checkpoint} checkpoint")
+            if self._abort:
+                return stopped("abort requested")
 
             decision, frame, kind, reason = acquire_phase(
                 checkpoint, expected_key,
@@ -2389,14 +2572,14 @@ class IndexingStateMachine:
         return False
 
     @timing.timed("scan.forward_input", scan=True)
-    def _advance_appraisal(self, frame, *, pause_generation=None) -> bool:
-        """Send one observed-arrow tap or one calibrated fallback swipe.
+    def _advance_appraisal(self, frame, *, pause_generation=None, reverse=False) -> bool:
+        """Send one observed directional-arrow tap or calibrated fallback swipe.
 
         False on a pause/generation change means no input was sent. A pause
         after sending input retains the completed operation's result so callers
         cannot replay a forward move. Existing abort semantics remain intact.
         """
-        from ..reader.appraisal_navigation import next_appraisal_target
+        from ..reader.appraisal_navigation import next_appraisal_target, previous_appraisal_target
 
         generation = self._pause_generation if pause_generation is None else pause_generation
 
@@ -2405,13 +2588,19 @@ class IndexingStateMachine:
 
         if interrupted():
             return False
-        target = next_appraisal_target(frame)
+        target = previous_appraisal_target(frame) if reverse else next_appraisal_target(frame)
         if interrupted():
             return False
         self._last_stable_image = frame
         if target is not None:
-            log.debug("Advancing appraisal through observed right arrow at %s", target)
+            log.debug("%s appraisal through observed %s arrow at %s",
+                      "Reversing" if reverse else "Advancing", "left" if reverse else "right", target)
             return bool(self._safe_tap(*target, jitter=0))
+        if reverse:
+            return bool(self._safe_swipe(
+                *self.regions.swipe_end, *self.regions.swipe_start,
+                self.regions.swipe_duration_ms, jitter=0,
+            ))
         return bool(self._fast_swipe())
 
     # ── Helpers ───────────────────────────────────────────────────────

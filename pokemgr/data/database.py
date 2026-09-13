@@ -41,6 +41,33 @@ class PokemonDatabase:
             self.conn.commit()
             self._pending_writes = 0
 
+    def clear_scanned_data(self) -> dict[str, int]:
+        """Atomically clear this connection's scans, preserving schema metadata.
+
+        Never unlink a WAL database: other connections must observe the same
+        committed deletion instead of retaining an older database and WAL.
+        """
+        self.flush()
+        if self.conn.in_transaction:
+            raise RuntimeError("Finish the pending database transaction before clearing scans")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            counts = {
+                "pokemon": self.conn.execute("SELECT COUNT(*) FROM pokemon").fetchone()[0],
+                "scan_sessions": self.conn.execute("SELECT COUNT(*) FROM scan_sessions").fetchone()[0],
+            }
+            self.conn.execute("DELETE FROM pokemon")
+            self.conn.execute("DELETE FROM scan_sessions")
+            remaining = self.conn.execute(
+                "SELECT (SELECT COUNT(*) FROM pokemon), (SELECT COUNT(*) FROM scan_sessions)"
+            ).fetchone()
+            if tuple(remaining) != (0, 0):
+                raise RuntimeError("Database clear could not be verified; deletion was rolled back")
+        self._pending_writes = 0
+        log.info("Cleared %d Pokemon and %d scan sessions from %s",
+                 counts["pokemon"], counts["scan_sessions"], self.db_path)
+        return counts
+
     def create_tables(self):
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS scan_sessions (
@@ -141,6 +168,23 @@ class PokemonDatabase:
             (datetime.now().isoformat(), total_pokemon, session_id),
         )
         self.conn.commit()
+
+    def get_session_device_fingerprints(self, session_ids) -> dict[str, str | None]:
+        """Read stored device bindings; never invent a missing session/binding."""
+        sessions = tuple(session_ids)
+        if any(not isinstance(value, str) or not value.strip() for value in sessions):
+            raise ValueError("Scan session IDs must be nonempty strings")
+        sessions = tuple(dict.fromkeys(sessions))
+        result = {}
+        for start in range(0, len(sessions), 500):
+            chunk = sessions[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self.conn.execute(
+                f"SELECT id, device_fingerprint FROM scan_sessions WHERE id IN ({placeholders})",
+                chunk,
+            ):
+                result[row["id"]] = row["device_fingerprint"]
+        return result
 
     # ── Insert ───────────────────────────────────────────────────────
 
@@ -249,6 +293,22 @@ class PokemonDatabase:
             ).fetchall()
         return [self._row_to_pokemon(r) for r in rows]
 
+    def _cleanup_rows(self) -> list[Pokemon]:
+        """Retain corrupt flag values as unknown mutation evidence."""
+        result = []
+        for raw in self.conn.execute("SELECT * FROM pokemon ORDER BY position"):
+            row = self._row_to_pokemon(raw)
+            for field in ("shiny", "shadow", "lucky", "is_dynamax", "favorited"):
+                if type(raw[field]) is not int or raw[field] not in (0, 1):
+                    setattr(row, field, raw[field])
+            result.append(row)
+        return result
+
+    def get_all_for_cleanup(self) -> list[Pokemon]:
+        """Read cleanup authority without coercing malformed stored flags."""
+        self.flush()
+        return self._cleanup_rows()
+
     def get_by_species(self, species: str,
                        session_id: str | None = None) -> list[Pokemon]:
         if session_id:
@@ -293,6 +353,27 @@ class PokemonDatabase:
         )
         self._maybe_commit()
 
+    def set_manual_decision(self, pokemon_id: int, decision: str):
+        """Commit a single reviewed decision, or leave none of it pending."""
+        if type(pokemon_id) is not int or pokemon_id <= 0:
+            raise ValueError("Pokemon ID must be a positive integer")
+        if decision not in ("KEEP", "TRANSFER"):
+            raise ValueError("Manual decision must be KEEP or TRANSFER")
+        self.flush()
+        if self.conn.in_transaction:
+            raise RuntimeError("Finish the pending database transaction before a manual decision")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            cursor = self.conn.execute(
+                "UPDATE pokemon SET decision = ?, decision_reason = 'MANUAL' WHERE id = ?",
+                (decision, pokemon_id),
+            )
+            observed = self.conn.execute(
+                "SELECT decision, decision_reason FROM pokemon WHERE id = ?", (pokemon_id,),
+            ).fetchone()
+            if cursor.rowcount != 1 or observed is None or tuple(observed) != (decision, "MANUAL"):
+                raise RuntimeError("Manual decision could not be saved and verified")
+
     def update_pvp_ranks(self, pokemon_id: int,
                          gl_rank: int | None, ul_rank: int | None):
         self.conn.execute(
@@ -326,6 +407,68 @@ class PokemonDatabase:
         except Exception:
             self.conn.rollback()
             raise
+
+    # TRACEWEAVER: file-role=reviewed-cleanup-persistence; req=REQ-MASS-001,REQ-DATA-001; trace=TRACE-MASS-001; ver=VER-SCAN-001
+    # TRACEWEAVER: entrypoint=update_favorited_reviewed; req=REQ-MASS-001,REQ-DATA-001; trace=TRACE-MASS-001,TRACE-DATA-001; ver=VER-SCAN-001
+    def update_favorited_reviewed(self, reviewed_rows, target=False):
+        """Save confirmed cleanup OFF states only while reviewed authority holds.
+
+        BEGIN IMMEDIATE keeps competing writers outside validation and update.
+        Every matching numeric/form group must be reviewed in full. The planner
+        also holds partial companions that could be the same card, so a caller
+        cannot persist only one member of an indistinguishable group.
+        """
+        from dataclasses import replace
+        from ..execution.pvp_cleanup import plan_pvp_cleanup
+
+        if target is not False:
+            raise ValueError("Reviewed cleanup can only save an OFF favorite state")
+        reviewed = tuple(reviewed_rows)
+        if not reviewed:
+            return
+
+        def key_for(row):
+            return (row.species.strip().casefold(), row.cp, row.hp,
+                    row.atk, row.def_, row.sta,
+                    row.shiny, row.shadow, row.lucky, row.is_dynamax)
+
+        if plan_pvp_cleanup(reviewed, key_for).eligible != len(reviewed):
+            raise RuntimeError("Reviewed cleanup contains incomplete, protected or ambiguous records")
+        fields = ("id", "scan_session_id", "position", "species", "cp", "hp",
+                  "atk", "def_", "sta", "shiny", "shadow", "lucky", "is_dynamax",
+                  "favorited", "decision")
+
+        def identity(row):
+            return tuple(getattr(row, field) for field in fields)
+
+        self.flush()
+        if self.conn.in_transaction:
+            raise RuntimeError("Finish the pending database transaction before reviewed cleanup")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            current = self._cleanup_rows()
+            plan = plan_pvp_cleanup(current, key_for, selected_ids=[row.id for row in reviewed])
+            allowed = {row.id: row for row in plan.candidates}
+            if len(allowed) != len(reviewed) or any(
+                row.id not in allowed or identity(row) != identity(allowed[row.id]) for row in reviewed
+            ):
+                raise RuntimeError("Reviewed cleanup records changed or became ambiguous")
+            for row in reviewed:
+                cursor = self.conn.execute(
+                    """UPDATE pokemon SET favorited = 0
+                       WHERE id = ? AND scan_session_id = ? AND position = ?
+                         AND species = ? AND cp = ? AND hp = ?
+                         AND atk = ? AND def_ = ? AND sta = ?
+                         AND shiny = ? AND shadow = ? AND lucky = ? AND is_dynamax = ?
+                         AND favorited = 1 AND decision = 'TRANSFER'""",
+                    identity(row)[:-2],
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("Reviewed cleanup record changed before saving OFF")
+            after = {row.id: row for row in self._cleanup_rows()}
+            if any(row.id not in after or identity(after[row.id]) != identity(replace(row, favorited=False))
+                   for row in reviewed):
+                raise RuntimeError("Reviewed cleanup OFF state could not be verified")
 
     def clear_decisions(self, session_id: str | None = None):
         if session_id:

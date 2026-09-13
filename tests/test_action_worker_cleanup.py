@@ -1,5 +1,7 @@
 """Action cancellation survives setup and completion follows local cleanup."""
 
+# TRACEWEAVER: file-role=action-worker-cleanup-tests; req=REQ-MASS-001; trace=TRACE-MASS-001; verifies=VER-SCAN-001
+
 import os
 from types import SimpleNamespace
 import unittest
@@ -102,6 +104,31 @@ class ActionWorkerCleanupTests(unittest.TestCase):
                      patch('pokemgr.data.database.PokemonDatabase'):
                     worker.run()
                 self.assertEqual(errors, ['Held: unreadable star'])
+
+    def test_keeper_structured_progress_is_forwarded_as_a_snapshot_before_result(self):
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                worker = FavoriteWorker(Mock(), SimpleNamespace(), Mock(), dry_run=dry_run)
+                executor, events = Mock(), []
+                worker.action_progress.connect(lambda payload: events.append(('action', payload)))
+                worker.progress.connect(lambda *args: events.append(('legacy', args)))
+                worker.finished.connect(lambda result: events.append(('finished', result)))
+                payload = {'traversal_id': 2, 'checked': 3, 'phase': 'reading'}
+
+                def run_action(*args, **kwargs):
+                    executor.on_action_progress(payload)
+                    payload['checked'] = 99
+                    executor.on_progress(3, 10, 'Checked Dragonite')
+                    return {'favorited': 2, 'checked': 3}
+
+                executor.favorite_keepers.side_effect = run_action
+                with patch('pokemgr.gui.workers.Executor', return_value=executor):
+                    worker.run()
+                self.assertEqual(events, [
+                    ('action', {'traversal_id': 2, 'checked': 3, 'phase': 'reading'}),
+                    ('legacy', (3, 10, 'Checked Dragonite')),
+                    ('finished', {'favorited': 2, 'checked': 3, 'dry_run': dry_run}),
+                ])
 
     def test_filter_worker_closes_local_database_before_success_signal(self):
         worker = FavoriteFilterWorker(Mock(), SimpleNamespace(), "shiny", "Shiny")

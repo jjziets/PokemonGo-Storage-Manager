@@ -168,6 +168,7 @@ class GameNavigator:
         """Detect current screen: 'game_map', 'storage', 'detail', 'appraisal', 'screen_off', or 'other'."""
         if img is None:
             img = self.adb.screencap()
+        self._last_screen_image = img
         arr = np.array(img)
         # Samsung screencaps are commonly RGBA.  Alpha is always 255, so
         # averaging all four channels makes a pure-black frame look bright
@@ -327,10 +328,42 @@ class GameNavigator:
         log.error("Failed to reach appraisal after 8 attempts")
         return False
 
+    def _save_storage_navigation_failure(self, reason, screen, attempt, pending_departure):
+        """Preserve the final observed pixels without requesting another frame."""
+        image = getattr(self, "_last_screen_image", None)
+        if not isinstance(image, Image.Image):
+            return
+        import json
+        from ..config import CACHE_DIR
+
+        try:
+            destination = CACHE_DIR / "navigation_failures"
+            destination.mkdir(parents=True, exist_ok=True)
+            prefix = destination / f"storage_{time.time_ns()}"
+            image.save(prefix.with_suffix(".png"))
+            prefix.with_suffix(".json").write_text(json.dumps({
+                "reason": reason, "screen": screen, "attempt": attempt,
+                "pending_departure": pending_departure,
+                "image_size": list(image.size),
+                "appraisal_close_target": self.appraisal_close_target(),
+                "capture": {key: image.info[key] for key in (
+                    "pokemgr_capture_started_at", "pokemgr_capture_finished_at",
+                    "pokemgr_stream_session", "pokemgr_stream_sequence", "pokemgr_stream_pts_us",
+                    "pokemgr_source_clock_generation", "pokemgr_source_clock_continuity",
+                ) if key in image.info},
+            }, indent=2), encoding="utf-8")
+            log.info("Saved storage navigation failure evidence: %s", prefix)
+        except (OSError, TypeError, ValueError):
+            log.exception("Could not save storage navigation failure evidence")
+
     def navigate_to_storage(self) -> bool:
         """From any screen, get to Pokemon storage."""
         restarted_unknown = False
         cleared_touch_protection = False
+        pending_departure = None
+        unknown_observations = 0
+        self._last_screen_image = None
+        screen = "unobserved"
 
         for attempt in range(8):
             if self.is_cancelled():
@@ -347,7 +380,19 @@ class GameNavigator:
 
             if screen == 'storage':
                 return True
-            elif screen == 'exit_dialog':
+            if screen != 'other':
+                unknown_observations = 0
+            # Sending another X or BACK while the first transition is still
+            # visible can overshoot storage. Retain the sent-input phase across
+            # pause/resume and observe again before authorizing another input.
+            if screen == pending_departure:
+                log.info("Waiting for %s departure after confirmed input", screen)
+                time.sleep(0.25)
+                continue
+            if screen not in ('other', 'screen_off'):
+                pending_departure = None
+
+            if screen == 'exit_dialog':
                 # Tap CANCEL
                 w, h = self.r.screen_width, self.r.screen_height
                 self.adb.tap(w // 2, int(h * 0.52), jitter=3)
@@ -359,11 +404,15 @@ class GameNavigator:
                 human_delay(1.5, 0.2)
                 if self.is_cancelled():
                     return False
+                if generation != self._observation_generation():
+                    continue
                 self.adb.tap(*pokemon_button, jitter=5)
                 human_delay(3.0, 0.5)
             elif screen == 'screen_off':
                 if self._virtual_display:
                     log.error("App stream is black or off; restart the stream before scanning")
+                    self._save_storage_navigation_failure(
+                        "App stream is black or off", screen, attempt + 1, pending_departure)
                     return False
                 if self.adb.is_screen_on():
                     if not cleared_touch_protection:
@@ -389,20 +438,28 @@ class GameNavigator:
             elif screen == 'appraisal':
                 # Tap X button to close appraisal (back key doesn't work)
                 self.adb.tap(*self.appraisal_close_target(), jitter=3)
+                pending_departure = 'appraisal'
                 human_delay(1.0, 0.2)
-                if self.is_cancelled():
-                    return False
-                # Now on detail screen — back to storage
-                self.adb.key_event(4)
-                human_delay(1.0, 0.3)
+                # The next fresh observation must establish detail or storage;
+                # never infer that X succeeded merely because time elapsed.
             elif screen == 'detail':
                 # Back is screen-relative and safe from a confirmed detail
                 # surface; it returns directly to storage.
                 self.adb.key_event(4)
+                pending_departure = 'detail'
                 human_delay(1.0, 0.3)
             else:
                 if self._virtual_display:
-                    log.error("Unknown app-stream screen; navigation stopped")
+                    unknown_observations += 1
+                    if unknown_observations < 4:
+                        log.info("Waiting for app-stream navigation to settle (%d/4)",
+                                 unknown_observations)
+                        time.sleep(0.25)
+                        continue
+                    log.error("Unknown app-stream screen after 4 observations; navigation stopped")
+                    self._save_storage_navigation_failure(
+                        "Unknown app-stream screen after 4 observations",
+                        screen, attempt + 1, pending_departure)
                     return False
                 # Do not guess at tablet coordinates on an unknown surface.
                 if not restarted_unknown:
@@ -412,6 +469,10 @@ class GameNavigator:
                 else:
                     time.sleep(2)
 
+        if not self.is_cancelled():
+            self._save_storage_navigation_failure(
+                "Storage navigation did not settle after 8 observations",
+                screen, 8, pending_departure)
         return False
 
     def tap_first_pokemon(self) -> bool:
